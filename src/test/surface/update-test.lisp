@@ -78,6 +78,25 @@ repo's own installer, for BODY."
   (is (equal "sha256 mismatch" (nle::last-line (format nil "staging~C~%sha256 mismatch~C~%" #\Return #\Return))))
   (is (equal "done" (nle::last-line (format nil "a~%done~%")))))
 
+(deftest update-windows-installer-reads-5.1s-own-modules ()
+  ;; Windows PowerShell 5.1 runs install.ps1. A PSModulePath inherited from a
+  ;; PowerShell 7 terminal names 7's module folders first, 5.1 finds no
+  ;; Get-FileHash in them, and every staging failed at its sha256: the child
+  ;; is handed the name empty, so 5.1 reads its own folders.
+  (flet ((child-environment (platform &aux environment)
+           (with-saved-globals ((nle::*installer-path*
+                                 (asdf:system-relative-pathname "nodecode" "tools/install.ps1"))
+                                (nle::*release-directory* (temp-path "releases")))
+             (with-stubbed-fdefinitions ((nlk:platform () platform)
+                                         (nle::run-bounded (argv &key ((:environment handed)) &allow-other-keys)
+                                           (declare (ignore argv))
+                                           (setf environment handed)
+                                           (values "" "" 0)))
+               (is (nle::run-installer "stage" "tv1" "staging"))))
+           environment))
+    (is (member "PSModulePath=" (child-environment :windows) :test #'string=) "the Windows installer's child gets no inherited PSModulePath")
+    (is (notany (lambda (entry) (search "PSModulePath" entry)) (child-environment :linux)) "install.sh's child is handed nothing of PowerShell's")))
+
 (deftest update-polls-every-half-hour-where-no-feed-streams ()
   ;; A box the feed cannot reach hears of a release only from the poller.
   (with-saved-globals ((nle::*installed-build* t))
