@@ -332,11 +332,11 @@ the plan runs low or a spent plan's credit pays, DANGER when nothing can pay."
     (remove nil
             (list
              (if plan
-                 (format nil "~a plan: ~a of ~a requests left~@[, resets ~a~]~@[ · ~a~]"
+                 (format nil "~a plan: ~a of ~a requests left~@[, ends ~a~]~@[ · ~a~]"
                          (account-plan-name plan)
                          (account-count (or (json-value plan :number "left") 0))
                          (account-count (or (json-value plan :number "requests") 0))
-                         (account-day (json-value plan :string "resets_at"))
+                         (account-day (json-value plan :string "ends_at"))
                          (when-let (threads (json-value plan :integer "threads"))
                            (format nil "~d of ~d running" (or (json-value plan :integer "running") 0) threads)))
                  "No plan.")
@@ -499,11 +499,11 @@ TONE's colour on whatever it stands on."
 
 (defun account-meter-segs (model)
   "The footer's account badge: the plan's name on a chip, then what is left on a chip of the
-meter's tone, both a link to /usage; NIL when this home is not signed in to nodecode.ai."
+meter's tone, both a link to /account; NIL when this home is not signed in to nodecode.ai."
   (when-let (value (getf *account-meter* :value))
     (let ((label (getf *account-meter* :label))
           (tone (or (getf *account-meter* :tone) :muted))
-          (target (cons :command "usage")))
+          (target (cons :command "account")))
       (if (grounds-shown-p)
           (list (make-seg :text (format nil " ~a " label) :link target :ground :sheet-chip
                           :tone (if (equal target (chat-model-hover-target model)) :disclosure-hover :sheet-chip))
@@ -555,8 +555,8 @@ slab's far edge."
                         (share (if (plusp requests) (min 1 (max 0 (/ left requests))) 0))
                         (threads (json-value plan :integer "threads"))
                         (running (min (or threads 0) (or (json-value plan :integer "running") 0)))
-                        (resets (json-value plan :string "resets_at"))
-                        (days (account-days-left resets)))
+                        (ends (json-value plan :string "ends_at"))
+                        (days (account-days-left ends)))
                    (list (list (list (s (format nil "~a plan" (account-plan-name plan))
                                         :foreground t))
                                (if (or plan-lit (plusp left))
@@ -568,7 +568,7 @@ slab's far edge."
                          (list (append (account-bar-segs share 26 tone (ground plan-lit))
                                        (list (s (format nil "  ~d%" (round (* 100 share))))))
                                nil)
-                         (list (append (list (s (format nil "~@[resets ~a~]~@[ · ~a~]" (account-day resets)
+                         (list (append (list (s (format nil "~@[ends ~a~]~@[ · ~a~]" (account-day ends)
                                                         (and days (format nil "~d day~:p" days)))))
                                        (when threads
                                          (list (s "     threads ")
@@ -620,9 +620,10 @@ LEFT clipped to what RIGHT leaves, RIGHT flush to the far pad and dropped when i
                                       :tone :muted)))))))
 
 (defun account-slab-rows (key)
-  "The nodecode.ai account as /usage shows it: its heading, then the plan's slab and the credit's
-side by side, a picker row per line keyed by KEY (a /usage tab), each a heading the arrows pass
-over that paints its line of both. NIL when this home is not signed in to nodecode.ai."
+  "The nodecode.ai account as /account and /usage show it: its heading, then the plan's slab and
+the credit's side by side, a picker row per line keyed by KEY (a /usage tab; empty in /account), each
+a heading the arrows pass over that paints its line of both. NIL when this home is not signed in
+to nodecode.ai."
   (when-let (usage (getf *account-meter* :usage))
     (destructuring-bind ((plan-ground plan-lines) (credit-ground credit-lines)) (account-slabs usage)
       (let* ((depth (+ 2 (max (length plan-lines) (length credit-lines))))

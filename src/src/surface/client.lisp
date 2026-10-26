@@ -3323,6 +3323,16 @@ models -- so a shell never builds the list itself.")
           :refusals (loop for provider across (or (gethash "providers" body) #())
                           for why = (gethash "refusal" provider)
                           when (stringp why) collect (cons (gethash "id" provider) why))
+          ;; Each provider a folder not installed there serves, which picking
+          ;; installs (PROVIDER-OFFERS' plists).
+          :offers (loop for offer across (or (gethash "offers" body) #())
+                        collect (append
+                                 (list :cell (gethash "cell" offer) :commit (gethash "commit" offer)
+                                       :provider (gethash "provider" offer) :name (gethash "name" offer)
+                                       :sign-in (or (gethash "sign_in" offer) "key")
+                                       :description (gethash "description" offer))
+                                 ;; in already, its provider not answering yet
+                                 (and (eq t (gethash "installed" offer)) (list :installed t))))
           ;; A gateway older than the providers field sends none: what it
           ;; has keys for is unknown here, not none.
           :unreported (not (nth-value 1 (gethash "providers" body))))))
@@ -3382,6 +3392,25 @@ run -- builds them from MODEL-CHOICES; a shell reads them from it
 (defun picker-listable-provider-ids ()
   "LISTABLE-PROVIDER-IDS as the serving image answers it."
   (if *serving* (listable-provider-ids) (getf *gateway-models* :listable)))
+
+(defun picker-provider-offers ()
+  "PROVIDER-OFFERS as the serving image answers it."
+  (if *serving* (ignore-errors (provider-offers)) (getf *gateway-models* :offers)))
+
+(defun install-offered-cell (model offer)
+  "Install OFFER's folder (PROVIDER-OFFERS) through MODEL's organism at the
+pin the picker read, then read its models and its commands again, the
+folder's own among them: => (:COMMANDS ENTRIES), or (:REFUSED WHY)."
+  ;; Off the loop: a hub install clones before it loads.
+  (handler-case
+      (progn (gateway-model-http-call model :post "/api/gateway/cells"
+                                      (json-object "name" (getf offer :cell) "on" t
+                                                   :opt "commit" (getf offer :commit))
+                                      :read-timeout 300)
+             ;; the folder is in: a reread that fails leaves the lists in hand
+             (ignore-errors (fetch-gateway-models model))
+             (list :commands (ignore-errors (gateway-command-entries model))))
+    (gateway-http-error (refusal) (list :refused (gateway-http-error-detail refusal)))))
 
 (defun picker-local-provider-ids (rows)
   "The providers of ROWS, /models' model rows, served from a machine of the
@@ -3861,7 +3890,7 @@ a provider's key."
   "Refill DIALOG, MODEL's open /models list, in place: its provider step's rows, else the
 catalog under its frequently used head, the cursor back on VALUE's row past the headings
 -- or, with TOP, on the first row."
-  (setf dialog.rows (if (eq dialog.kind :model-providers)
+  (setf dialog.rows (if (connect-dialog-p dialog)
                         (funcall (connect-dialog-provider-rows dialog))
                         (models-frequent-picker-rows
                          (models-dialog-catalog-rows dialog)
@@ -4047,16 +4076,19 @@ place, the search text stays, and the selection follows its row value — a
 value the refresh dropped leaves the cursor on its seat."
   (declare (ignore landed))
   (when (and (picker-dialog-p dialog)
-             ;; The /models catalog in either mode.
+             ;; The /models catalog in either mode, or a provider list: /models'
+             ;; or the setup walk's, which has no kind and opens before the
+             ;; gateway's list lands -- its offers (PROVIDER-OFFERS) came with
+             ;; it, and a walk that kept its first rows never listed them.
              (or (member dialog.kind '(:models :auxiliary-models))
-                 (and (eq dialog.kind :model-providers)
+                 (and (connect-dialog-p dialog)
                       (eq :provider (connect-dialog-step dialog)))))
-    (setf dialog.title (if (eq dialog.kind :model-providers) "Models"
-                           (models-picker-title (length (models-dialog-catalog-rows dialog)) nil
-                                                :auxiliary (eq dialog.kind :auxiliary-models))))
-    ;; a list opened before anything was cached said it was loading
-    (unless (eq dialog.kind :model-providers)
-      (setf dialog.empty-label "No models found"))
+    (cond ((eq dialog.kind :model-providers) (setf dialog.title "Models"))
+          ((not (connect-dialog-p dialog))
+           (setf dialog.title (models-picker-title (length (models-dialog-catalog-rows dialog)) nil
+                                                   :auxiliary (eq dialog.kind :auxiliary-models))
+                 ;; a list opened before anything was cached said it was loading
+                 dialog.empty-label "No models found")))
     (restock-models-dialog model dialog (picker-highlighted-value dialog))))
 
 (defparameter +new-profile-action+ :new-profile
@@ -4882,6 +4914,8 @@ the list on both shells)."
   ;; catalog too, and says so (PROVIDER-ID-REFUSAL) rather than saving a key
   ;; no lane could use.
   ;; Sorted by display name then id: Zig walked a map order a Lisp hash table lacks.
+  ;; A provider an uninstalled folder serves is listed too, and picking it
+  ;; installs that folder (PICKER-PROVIDER-OFFERS).
   (let ((catalog (models-catalog-table))
         ;; The ids worth a PROVIDER-AUTH-STATE probe, which opens a file per
         ;; call.
@@ -4954,6 +4988,24 @@ the list on both shells)."
                  (format nil "~d model~:p  ~a" (models id)
                          (or (key-check-state id)
                              (if (eq state :none) "configured" "connected")))))))
+      ;; A provider a folder not installed here serves (PROVIDER-OFFERS):
+      ;; Enter installs the folder first (CONNECT-INSTALL). Its models.dev row,
+      ;; when it has one, becomes the folder's -- a key saved from that row
+      ;; alone reached a lane that cannot talk to it (OpenCode Go answers 400
+      ;; MissingSessionID) -- and one models.dev lacks (ChatGPT's Codex) is
+      ;; listed by the name its folder gives it. The row says nothing of the
+      ;; install: picking it is the whole of it (peasantry1833: "Less is more").
+      (dolist (offer (picker-provider-offers))
+        (let* ((id (getf offer :provider))
+               (held (find-if (lambda (row)
+                                (and (string-equal id (provider row))
+                                     (not (getf (picker-row-value row) :install))))
+                              rows)))
+          (if held
+              (setf (picker-row-value held) (list* :install offer (picker-row-value held)))
+              (push (make-picker-row :label (getf offer :name)
+                                     :value (list :provider id :install offer))
+                    rows))))
       (let* ((sorted (stable-sort (sort rows #'string-lessp :key #'provider)
                                   (lambda (a b &aux (at (pin a)) (bt (pin b)))
                                     (cond ((and at bt) (< at bt))
@@ -4988,6 +5040,19 @@ the list on both shells)."
                                 :detail "Enter a provider id from models.dev"
                                 :value (list :custom t))))))))
 
+(defun gateway-key-check (model provider key)
+  "PROVIDER-KEY-CHECK of KEY for PROVIDER as MODEL's organism answers it
+(POST /api/gateway/keys, check: true), as the list (VERDICT WORDS) the
+/models sink reads: VERDICT NIL when nothing was asked."
+  (let ((answer (gateway-model-http-call model :post "/api/gateway/keys"
+                                         (json-object "provider" provider "key" (nlk:trimmed key) "check" t)
+                                         :read-timeout (+ *provider-models-fetch-timeout-seconds* 15))))
+    (list (cdr (assoc (json-value answer :string "verdict")
+                      '(("works" . :works) ("refused" . :refused)
+                        ("unreachable" . :unreachable) ("unchecked" . :unchecked))
+                      :test #'equal))
+          (json-value answer :string "words"))))
+
 (defun connect-credential-sink (&optional saved)
   "The /models wizard's ON-SAVE: ask the provider whether it takes the key
 (PROVIDER-KEY-CHECK, off the loop), then SAVE-PROVIDER-API-KEY into the
@@ -5000,10 +5065,15 @@ start, and the same key is checked again -- else T."
   ;; (a hang, a 5xx, a 404, or the check itself failing) may still be right:
   ;; it is saved, the message says it was not checked and why, and
   ;; *KEY-CHECKS* keeps it off the list's `connected'.
+  ;; A shell asks its organism (GATEWAY-KEY-CHECK): the address a key is
+  ;; checked at is the one a turn dials, and a cell that serves the provider
+  ;; sets it there only -- OpenCode Go's, checked at models.dev's, answered 404.
   (lambda (model provider-id secret done)
     (off-loop
      model
-     (lambda () (multiple-value-list (provider-key-check provider-id (nlk:trimmed secret))))
+     (lambda () (if *serving*
+                    (multiple-value-list (provider-key-check provider-id (nlk:trimmed secret)))
+                    (gateway-key-check model provider-id secret)))
      ;; VALUE is the check's two values as a list, or OFF-LOOP's failure,
      ;; which is said plainly: its text is a Lisp condition's.
      (lambda (model value)
@@ -5541,6 +5611,19 @@ out has none and takes them when it lands (USAGE-DIALOG-ROWS)."
                            (remove '(:account) own :key #'picker-row-value :test #'equal))
                    own)))
 
+(defun dialog-account-read (model redraw)
+  "Read the nodecode.ai account's meter again from the gate for the dialog open now, off the loop:
+it lands in *ACCOUNT-METER* and the dialog's rows become (REDRAW ROWS). The footer reads it at
+connect and after a turn only, so a top-up bought while this shell was open read `API credit:
+none' in the dialog until the next prompt (checkout audit, 2026-10-22)."
+  (dialog-read model
+               (lambda () (gateway-model-http-call model :get "/api/gateway/account?fresh=1" nil))
+               (lambda-ignoring (model dialog value)
+                 (unless (off-loop-failure value)
+                   (setf *account-meter* (account-meter-of value)
+                         dialog.rows (funcall redraw dialog.rows)))
+                 nil)))
+
 (defun slash-usage-op (model &optional args &aux (range (usage-range-word args)))
   "Open the /usage dialog on the range ARGS names, its reads off the loop."
   (cond
@@ -5566,18 +5649,28 @@ out has none and takes them when it lands (USAGE-DIALOG-ROWS)."
                                                                            :test #'equal)
                                                     (usage-dialog-rows id value)))
                           nil))))
-       ;; The account's meter, read again from the gate: it was read at connect
-       ;; and after a turn only, so a top-up bought while this shell was open
-       ;; read `API credit: none' here until the next prompt (checkout audit,
-       ;; 2026-10-22).
-       (dialog-read model
-                    (lambda () (gateway-model-http-call model :get "/api/gateway/account?fresh=1" nil))
-                    (lambda-ignoring (model dialog value)
-                      (unless (off-loop-failure value)
-                        (setf *account-meter* (account-meter-of value)
-                              dialog.rows (usage-dialog-account-rows dialog.rows)))
-                      nil))
+       (dialog-account-read model #'usage-dialog-account-rows)
        nil)))
+
+;;; --- /account ----------------------------------------------------------------
+;;; What the footer's account badge opens: the nodecode.ai account alone, the
+;;; plan's slab and the API credit's, no ranges and none of /usage's breakdown
+;;; -- asked 2026-10-25: "just show the Nodecode.ai account and the API
+;;; credit box, thats it". No headless arm: a room or a page shown this home's
+;;; balance would read someone's account.
+
+(defun slash-account-op (model)
+  "Open the nodecode.ai account dialog: the plan's slab and the API credit's as the footer's meter
+last read them, then read again from the gate (DIALOG-ACCOUNT-READ)."
+  (flet ((rows (&optional stale)
+           (declare (ignore stale))
+           (account-slab-rows "")))
+    (open-picker-dialog model "Usage" (rows) (constantly nil)
+                        :kind :account
+                        :empty-label "Not signed in to nodecode.ai: /login signs in"
+                        :hint "esc close")
+    (dialog-account-read model #'rows))
+  nil)
 
 ;;; --- /think ------------------------------------------------------------------
 ;;; The picker and the footer read one answer, GET /api/gateway/target

@@ -9042,7 +9042,7 @@ it answers. No row, or no handler: nothing happens."
          t)
         (dialog.input-label (setf dialog.input (concatenate 'string dialog.input line)) t)
         ((and (connect-dialog-p dialog)
-              (member (connect-dialog-step dialog) '(:result :checking)))
+              (member (connect-dialog-step dialog) '(:result :checking :installing :signing-in)))
          nil)
         ((picker-dialog-searchable dialog)
          (picker-search-mutate dialog (clip (concatenate 'string dialog.search line)
@@ -9622,11 +9622,11 @@ result breaks to, a blank, the muted context -- or NIL for a list body."
                          (if (plusp (length value)) (seg value :composer) (seg "(empty)" :muted)))
                    dialog.input-context)))
         ((and (connect-dialog-p dialog)
-              (member (connect-dialog-step dialog) '(:result :checking)))
+              (member (connect-dialog-step dialog) '(:result :checking :installing :signing-in)))
          ;; A result's words break to the panel's width, as a toast's
          ;; do, and MORE carries the lines after the first: a refusal
          ;; ran its remedy off the edge, past column 72 at 80 columns.
-         (let* ((checking (eq (connect-dialog-step dialog) :checking))
+         (let* ((checking (member (connect-dialog-step dialog) '(:checking :installing :signing-in)))
                 (room (max 8 (docked-panel-room width)))
                 (lines (if checking
                            (list (connect-checking-clock dialog))
@@ -9635,11 +9635,32 @@ result breaks to, a blank, the muted context -- or NIL for a list body."
            (values (list (seg (or (first lines) "")
                               (if checking :muted :danger)))
                    (connect-provider-name dialog)
-                   (rest lines)))))
+                   (if (eq :signing-in (connect-dialog-step dialog))
+                       ;; under the clock, where to sign in -- the page a link,
+                       ;; its query cut, then the whole address verbatim and
+                       ;; dimmed when it carries more than the page -- and the
+                       ;; device code when there is one; a command that
+                       ;; answered no page says its words
+                       (multiple-value-bind (url code) (sign-in-facts (connect-dialog-result-message dialog))
+                         (if url
+                             ;; a blank row ahead of each part, so the clock,
+                             ;; the page, the address and the code stand apart
+                             (loop for part in (list (list (list (make-seg :text (format nil "Sign in at ~a" (sign-in-page-label url))
+                                                                           :tone :foreground :link url)))
+                                                     (when (find-if (lambda (c) (member c '(#\? #\#))) url)
+                                                       (loop for piece in (wrapped-lines url room)
+                                                             collect (list (make-seg :text piece :tone :muted :link url))))
+                                                     (and code (list (list (make-seg :text (format nil "Code ~a" code)
+                                                                                     :tone :foreground :bold t)))))
+                                   when part nconc (cons '() part))
+                             (loop for line in (split-lines (connect-dialog-result-message dialog))
+                                   nconc (wrapped-lines line room))))
+                       (rest lines))))))
     (when lead
       (append (list (docked-panel-row lead width surface))
               (loop for line in more
-                    collect (docked-panel-row (list (seg line :danger)) width surface))
+                    collect (docked-panel-row (if (stringp line) (list (seg line :danger)) line)
+                                              width surface))
               (list (docked-panel-row '() width surface))
               (when (plusp (length context))
                 (list (docked-panel-row (list (seg context :muted)) width surface)))))))
@@ -10008,6 +10029,18 @@ picker's own ceiling thumb."
      :subtitle "Asking ~a whether it takes this key, waiting up to ~d seconds."
      :hint "esc back"
      :empty-label "")
+    (:installing
+     :context "Install"
+     ;; a control string: CONNECT-INSTALL fills in the folder and its pin
+     :subtitle "Installing ~a~@[ at ~a~], the cell that serves this provider."
+     :hint "esc back"
+     :empty-label "")
+    (:signing-in
+     :context "Sign in"
+     ;; none: the panel names the provider under the page already
+     :subtitle ""
+     :hint "esc back"
+     :empty-label "")
     (:result
      :context "Errors"
      :subtitle "Credential setup needs attention."
@@ -10032,6 +10065,9 @@ slots the panel already reads."
   (dolist (slot '(searchable context subtitle hint empty-label no-match-label
                   input-label input-secret-p))
     (setf (slot-value dialog slot) (getf spec (intern (string slot) :keyword))))
+  ;; The sign-in step has no summary: its header is the title row and a
+  ;; blank, so the clock sits one blank under the title, not three.
+  (setf dialog.header-rows (and (eq step :signing-in) 2))
   (when-let (walk (connect-dialog-walk dialog))
     (setf dialog.context walk
           dialog.hint (or (getf spec :walk-hint) dialog.hint)))
@@ -10043,8 +10079,9 @@ slots the panel already reads."
   ;; The check says how long it waits and counts up to it, as the import's
   ;; does: a static `checking...' would read as a hang. The tick repaints
   ;; when the tenth shown moves.
-  (setf (connect-dialog-checking-since dialog) (and (eq step :checking) (get-internal-real-time))
-        dialog.on-tick (and (eq step :checking)
+  (setf (connect-dialog-checking-since dialog) (and (member step '(:checking :installing :signing-in))
+                                                    (get-internal-real-time))
+        dialog.on-tick (and (member step '(:checking :installing :signing-in))
                             (let ((shown nil))
                               (lambda (model dialog &aux (now (connect-checking-clock dialog)))
                                 (declare (ignore model))
@@ -10064,8 +10101,13 @@ slots the panel already reads."
 
 (defun connect-checking-clock (dialog &aux (since (connect-dialog-checking-since dialog)))
   "`checking… 1.3s', the checking step's body line, counting from when the
-step began."
-  (format nil "checking… ~a" (format-turn-elapsed (if since (since-ms since) 0))))
+step began; `installing… 1.3s' on the installing step, `waiting for the
+sign-in… 1.3s' on the sign-in step."
+  (format nil "~a… ~a" (case (connect-dialog-step dialog)
+                         (:installing "installing")
+                         (:signing-in "waiting for the sign-in")
+                         (t "checking"))
+          (format-turn-elapsed (if since (since-ms since) 0))))
 
 (defun connect-provider-name (dialog)
   "The provider as the wizard names it: the catalog label, else the id."
@@ -10096,6 +10138,156 @@ provider's id, a provider's key. Any other row moves nothing."
               (connect-dialog-key-page dialog) (getf value :key-page)))
     (connect-enter-step dialog (if (getf value :custom) :custom-provider :api-key))))
 
+(defun connect-install (model dialog row &key key &aux (value (picker-row-value row))
+                                                     (offer (getf value :install))
+                                                     (id (getf value :provider)))
+  "Enter on ROW, a provider a folder not installed here serves
+(PICKER-PROVIDER-OFFERS): install that folder through the organism, off the
+loop (INSTALL-OFFERED-CELL), then go on as the provider asks -- the command
+its folder signs in with, a pick when it answers already (a key it has, or a
+login the folder brings: Claude Code's is the claude CLI's), else its key
+step. KEY, Ctrl+E's, asks for a key whatever the folder signs in with. A
+refused install says why over the list, and nothing else moved."
+  (connect-clear-credential dialog)
+  (setf (connect-dialog-provider-id dialog) id
+        (connect-dialog-provider-label dialog) (picker-row-label row))
+  (flet ((go-on (model commands &aux (how (getf offer :sign-in)))
+           ;; the folder is in: on as the provider asks
+           (when commands (set-gateway-commands commands))
+           (setf dialog.rows (funcall (connect-dialog-provider-rows dialog)))
+           (cond
+             ;; the folder signs in with a command of its own:
+             ;; it runs, and the wizard waits on its words
+             ((and (not key) (uiop:string-prefix-p "/" how))
+              (connect-sign-in model dialog how))
+             ;; it answers already -- a key it had, or a login
+             ;; its folder brings, which the reread rows say: a
+             ;; pick, as Enter on a connected provider is
+             ((and (not key)
+                   (or (getf value :connected)
+                       (find-if (lambda (row &aux (now (picker-row-value row)))
+                                  (and (equal id (getf now :provider))
+                                       (getf now :connected)))
+                                dialog.rows)))
+              (let ((on-success (connect-dialog-on-success dialog)))
+                (dismiss-dialog model (and on-success
+                                           (lambda (model) (funcall on-success model id))))))
+             (t (connect-ask-key dialog row)))))
+    (if (getf offer :installed)
+        ;; in already, its provider not answering yet -- a sign-in Esc left
+        ;; unfinished: nothing to install, on to it
+        (go-on model nil)
+        (progn
+          (connect-enter-step dialog :installing)
+          (setf dialog.subtitle (format nil dialog.subtitle (getf offer :cell)
+                                        (let ((pin (getf offer :commit)))
+                                          (and (stringp pin) (subseq pin 0 (min 7 (length pin)))))))
+          (off-loop model
+                    (lambda () (install-offered-cell model offer))
+                    (lambda (model answer)
+                      ;; Esc, or another dialog, moved the wizard on: the answer moves nothing
+                      (if (not (and (eq dialog (chat-model-dialog model))
+                                    (eq :installing (connect-dialog-step dialog))))
+                          :quiet
+                          (let ((refused (or (off-loop-failure answer) (getf answer :refused))))
+                            (if refused
+                                (progn
+                                  (connect-clear-credential dialog)
+                                  (connect-enter-step dialog :provider)
+                                  (show-status model (format nil "~a was not installed: ~a" (getf offer :cell) refused)
+                                               :error-p t))
+                                (go-on model (getf answer :commands)))
+                            (render-state model))))))))
+  t)
+
+(defun sign-in-facts (text &aux (text (or text "")))
+  "The page TEXT, what a folder's sign-in command answered, sends the
+operator to, and the device code it asks for there when it names one: =>
+(values URL CODE), either NIL."
+  ;; The code is the word after `code' that reads as one -- a digit in it, or
+  ;; capitals around a dash: `enter the code ABCD-1234' or `NFGT-NHBJ', never
+  ;; `send /openai-codex code ADDRESS' nor `Kimi Code sign-in'.
+  (let ((words (loop with start = nil
+                     for i from 0 to (length text)
+                     for blank = (or (= i (length text))
+                                     (member (char text i) '(#\Space #\Tab #\Newline #\Return)))
+                     if (and blank start) collect (subseq text start i) and do (setf start nil)
+                     else if (and (not blank) (null start)) do (setf start i))))
+    (values (let ((url (find-if (lambda (word &aux (host (search "://" word)))
+                                  ;; a loopback address is where the browser
+                                  ;; comes back to, never where to sign in
+                                  (and host (< host 6)
+                                       (member (subseq word 0 host) '("http" "https") :test #'string-equal)
+                                       (notany (lambda (loopback)
+                                                 (uiop:string-prefix-p loopback (subseq word (+ host 3))))
+                                               '("localhost" "127." "[::1]"))))
+                                words)))
+              (and url (string-right-trim ".,;)" url)))
+            (loop for (word next) on words
+                  for code = (and next (string-trim ".,;:()'\"" next))
+                  when (and code (string-equal (string-trim ":" word) "code")
+                            (<= 4 (length code) 16)
+                            (every (lambda (c) (or (alphanumericp c) (char= c #\-))) code)
+                            (or (some #'digit-char-p code)
+                                (and (find #\- code) (notany #'lower-case-p code))))
+                    return code))))
+
+(defun sign-in-page-label (url &aux (from (+ 3 (or (search "://" url) -3))))
+  "URL as the sign-in panel names it: no scheme, no query."
+  (subseq url from (or (position-if (lambda (c) (member c '(#\? #\#))) url :start from)
+                       (length url))))
+
+(defparameter *connect-sign-in-poll-seconds* 2
+  "How long CONNECT-SIGN-IN waits between two reads of whether the provider
+answers yet.")
+
+(defun connect-sign-in (model dialog how &aux (id (connect-dialog-provider-id dialog)))
+  "Run HOW, the command a folder just installed signs in with, and wait on
+DIALOG for its provider to answer: what the command said -- the address to
+open, a device code -- stands in the panel, and once the gateway's list reads
+the provider connected the pick goes on to its models, as Enter on a
+connected provider does. Esc goes back to the list (CONNECT-BACK), the
+folder's sign-in still waiting without it."
+  ;; Each read lands on the loop, which decides whether to read again: the
+  ;; worker never looks at the dialog.
+  (labels ((ours (model) (and (eq dialog (chat-model-dialog model))
+                              (eq :signing-in (connect-dialog-step dialog))))
+           (wait (model)
+             (off-loop model
+                       (lambda ()
+                         (sleep *connect-sign-in-poll-seconds*)
+                         (fetch-gateway-models model)
+                         (and (member id (picker-connected-provider-ids) :test #'string-equal) t))
+                       (lambda (model connected)
+                         (cond ((not (ours model)) :quiet)
+                               ((eq t connected)
+                                (let ((on-success (connect-dialog-on-success dialog)))
+                                  (dismiss-dialog model (and on-success
+                                                             (lambda (model) (funcall on-success model id)))))
+                                (render-state model))
+                               (t (wait model) :quiet))))))
+    (connect-enter-step dialog :signing-in)
+    (setf dialog.subtitle (format nil dialog.subtitle (connect-provider-name dialog)))
+    (off-loop model
+              (lambda () (json-value (gateway-slash-answer model how) :string "text"))
+              (lambda (model text &aux (failure (off-loop-failure text))
+                                       (url (and (not failure) (sign-in-facts text))))
+                (cond ((not (ours model)) :quiet)
+                      ;; no page to sign in at: the command said why not --
+                      ;; over the list, as a refused install says it
+                      ((null url)
+                       (setf (connect-dialog-result-message dialog) "")
+                       (connect-clear-credential dialog)
+                       (connect-enter-step dialog :provider)
+                       (show-status model (if failure (format nil "~a: ~a" how failure) (or text how))
+                                    :error-p t)
+                       (render-state model))
+                      (t (setf (connect-dialog-result-message dialog) text)
+                         ;; the page opens where there is a browser to open it
+                         (ignore-errors (open-target url))
+                         (wait model)
+                         (render-state model)))))))
+
 (defun connect-back (model dialog)
   "One step back (the Zig backConnectDialog): from the provider step the
 flow closes; either input step drops the half-gathered credential and
@@ -10116,6 +10308,15 @@ checked."
                                 (json-object "models" (gethash dialog *models-frequent-by-dialog* #())))))
     ;; the answer, when it lands, finds the dialog moved on and takes nothing
     (:checking (connect-enter-step dialog :api-key))
+    ;; the install goes on in the organism; its answer finds the list
+    (:installing
+     (connect-clear-credential dialog)
+     (connect-enter-step dialog :provider))
+    ;; the folder's sign-in goes on waiting; the list takes nothing from it
+    (:signing-in
+     (setf (connect-dialog-result-message dialog) "")
+     (connect-clear-credential dialog)
+     (connect-enter-step dialog :provider))
     (:result
      (setf (connect-dialog-result-message dialog) "")
      (cond
@@ -10142,7 +10343,11 @@ showing for one to mean anything else."
      (connect-back model dialog)
      t)
     ((and (eq step :provider) ctrl (characterp key) (char-equal key #\e))
-     (connect-ask-key dialog (selected-of (picker-visible-rows dialog) (connect-dialog-selection dialog)))
+     (let ((row (selected-of (picker-visible-rows dialog) (connect-dialog-selection dialog))))
+       ;; a provider no installed folder serves yet is installed first
+       (if (getf (and row (picker-row-value row)) :install)
+           (connect-install model dialog row :key t)
+           (connect-ask-key dialog row)))
      t)
     ((eq key :enter)
      ;; The Zig submit + persist ladder; a failed save is the result step's message.
@@ -10156,6 +10361,9 @@ showing for one to mean anything else."
                    (dismiss-dialog model (and on-success
                                               (lambda (model) (funcall on-success model choice))))))
             (cond ((getf value :model) (pick (getf value :model)))
+                  ;; A provider a folder not installed here serves: the
+                  ;; folder first, then what the provider asks for.
+                  ((getf value :install) (connect-install model dialog row))
                   ;; A provider whose key answers is a pick, not a key to paste
                   ;; again: Enter picks it. Ctrl+E pastes a new one.
                   ((getf value :connected) (pick (getf value :provider)))
@@ -10210,7 +10418,7 @@ showing for one to mean anything else."
             (if on-save
                 (funcall on-save model (connect-dialog-provider-id dialog) secret #'done)
                 (done model "no credential sink is wired" t)))))
-       (:checking nil)
+       ((:checking :installing) nil)
        ;; a check nothing listened for is checked again, the same key
        (:result (if-let (secret (connect-dialog-retry dialog))
                   (progn (connect-enter-step dialog :api-key)
@@ -13843,7 +14051,7 @@ Zig launcher gives the same thing."
                   :detail "It owns the store and serves its gateway until stopped, or exits at once when another process already owns it. A reconnecting shell spawns one; it is also the way to run an organism with no terminal.")
    (nlk:make-verb "login" "sign in to your nodecode.ai account: a subscription or API credits"
                   :arguments "[--subscription | --api]"
-                  :detail "Asks which one unless a flag says it, opens nodecode.ai in your browser with this machine's code in the page, and waits there for you to sign in with your nodecode.ai account and allow the machine; over ssh, open the printed page on any device. The key is saved locally and the account's meter printed: the plan's requests left and when they reset, the API credit. No terminal UI or session is opened. /login does the same from inside the shell; /models is for other providers.")
+                  :detail "Asks which one unless a flag says it, opens nodecode.ai in your browser with this machine's code in the page, and waits there for you to sign in with your nodecode.ai account and allow the machine; over ssh, open the printed page on any device. The key is saved locally and the account's meter printed: the plan's requests left and when the plan ends, the API credit. No terminal UI or session is opened. /login does the same from inside the shell; /models is for other providers.")
    (nlk:make-verb "machine" "link this machine to your nodecode.ai account with a code from its Machines page"
                   :label "machine link [CODE]"
                   :arguments "link [CODE]"
