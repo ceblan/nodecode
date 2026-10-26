@@ -2895,9 +2895,10 @@ run it — SNAPSHOT-EFFECTIVE-PROVIDER-CONFIG reads these three."
              (*endpoint* (if ,configured nil *endpoint*)))
          ,@body))))
 
-(defun complete (system user &key session-id max-tokens (fallback-p t))
-  "One side call: SYSTEM as the whole instruction, USER as the single
-message, no tools and no history — the answer's own text."
+(defun %side-call (system content &key session-id max-tokens (fallback-p t))
+  "One side call: SYSTEM as the whole instruction, CONTENT as the single
+message's content — a string, or a vector of typed parts — no tools and no
+history; the answer's own text."
   ;;
   ;; It runs on the auxiliary target (WITH-AUXILIARY-MODEL), so a title, a
   ;; classification, a recap and every other piece of side work share one
@@ -2916,7 +2917,7 @@ message, no tools and no history — the answer's own text."
                                    :provider-config (snapshot-effective-provider-config)
                                    :base-system-prompt (or system "")
                                    :messages (list (json-object "role" "user"
-                                                                "content" user))))
+                                                                "content" content))))
                                  :on-part nil))))))
     (handler-case (ask)
       (error (condition)
@@ -2931,6 +2932,31 @@ message, no tools and no history — the answer's own text."
                 condition)
         (let ((*auxiliary-model* nil))
           (ask))))))
+
+(defun complete (system user &key session-id max-tokens (fallback-p t))
+  "One side call: SYSTEM as the whole instruction, USER as the single
+message, no tools and no history — the answer's own text. The auxiliary
+target answers (WITH-AUXILIARY-MODEL), one retry on the session's own target
+when it refuses."
+  (%side-call system user :session-id session-id :max-tokens max-tokens
+                          :fallback-p fallback-p))
+
+(defun complete-images (system user images &key session-id max-tokens (fallback-p t))
+  "One side call whose single user message carries IMAGES — (MEDIA-TYPE .
+BASE64) pairs, in order, after the text USER — asking of the auxiliary
+target; the answer's own text. A model whose input is text only fails here,
+which is the caller's to catch and try the next link of its chain."
+  ;; The same shape a turn's attached images take (IMAGE-CONTENT-PARTS,
+  ;; context.lisp): a data: URI per image the lane decodes, the text part
+  ;; first so a prompt reading them in order reads as written.
+  (%side-call system
+              (apply #'vector
+                     (make-text-content-part user)
+                     (loop for (media-type . payload) in images
+                           collect (make-image-content-part
+                                    (format nil "data:~a;base64,~a" media-type payload))))
+              :session-id session-id :max-tokens max-tokens
+              :fallback-p fallback-p))
 
 ;;; --- credential chain -------------------------------------------------
 ;;; One resolution seam (the providers/root.zig localTurnCredential ladder):

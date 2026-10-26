@@ -459,7 +459,7 @@ renderer, the program loop.")
    ;; --- the auxiliary target (provider.lisp): the model side work runs
    ;; on, the pick that moves it, the binding a layer or a cell runs its
    ;; own side call under, and the call itself ---
-   #:auxiliary-model #:with-auxiliary-model #:complete
+   #:*auxiliary-model* #:auxiliary-model #:with-auxiliary-model #:complete #:complete-images
    ;; --- the folder report, inherited from the kernel (cells.lisp), and
    ;; the gateway's lifecycle over it (gateway.lisp) ---
    #:cells #:restart-cells
