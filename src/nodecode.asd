@@ -267,17 +267,18 @@ of stacking."
      ;; theme precedes ui: the design system (palette, wrap, gutters) is pure
      ;; material the display policy consumes.
      (:file "tui/theme")
-     ;; editor follows theme: the composer's editing engine wraps through
-     ;; BREAK-FRAGMENTS and measures through TEXT-DISPLAY-WIDTH, theme's
-     ;; authorities; ui constructs it and paints its rows.
+     ;; keys follows theme: dialog search, the keybind keymap, the composer
+     ;; catalogs and paste normalization are pure input material — and the
+     ;; editing engine below applies every key through the keymap it resolves.
+     (:file "tui/keys")
+     ;; editor follows theme and keys: the composer's editing engine wraps
+     ;; through BREAK-FRAGMENTS and measures through TEXT-DISPLAY-WIDTH,
+     ;; theme's authorities, and its keys are the keymap's actions; ui
+     ;; constructs it and paints its rows.
      (:file "tui/editor")
      ;; slash precedes ui: the command catalog/parser is pure material both
      ;; shells consume; the execution methods live with the shells.
      (:file "tui/slash")
-     ;; keys precedes ui: dialog search, the keybind keymap, the composer
-     ;; catalogs, and paste normalization are pure input material the update
-     ;; function consults.
-     (:file "tui/keys")
      (:file "tui/ui")
      (:file "surface/gateway")
      ;; One debugger boundary for raw, cell and product workers; gateway owns notices.

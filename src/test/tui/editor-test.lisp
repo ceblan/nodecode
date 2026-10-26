@@ -366,3 +366,162 @@
     (is (ed-key ed #\u nlt:+mod-ctrl+))
     (is (equal "above" (nle::editor-value ed)) "the second Ctrl+U removes that empty line")
     (is (equal '(0 5) (ed-cursor ed)))))
+
+;;; --- the keymap the engine dispatches through ----------------------------
+;;; EDITOR-HANDLE-KEY tests no literal key: every chord it applies is an action
+;;; of the resolved keymap, so a key moved in keybinds.json moves here.
+
+(defun ed-key-in (ed keymap code &optional (mod 0))
+  "Feed one key press through KEYMAP; => whether the text changed."
+  (nle::editor-handle-key ed (nlt:make-key-press-msg :code code :mod mod) keymap))
+
+(deftest editor-keys-are-the-keymaps-actions ()
+  (let ((ed (ed-make "alpha beta"))
+        (keymap (nle::resolve-keybinds '((:editor-cursor-line-end . "f1")))))
+    (ed-key-in ed keymap :end)
+    (is (equal '(0 0) (ed-cursor ed)) "the displaced default moves nothing")
+    (ed-key-in ed keymap :f1)
+    (is (equal '(0 10) (ed-cursor ed)) "the configured chord is the line end"))
+  (let ((ed (ed-make "alpha beta"))
+        (keymap (nle::resolve-keybinds '((:editor-delete-word-backward . "none")))))
+    (ed-set-cursor ed 0 10)
+    (is (null (ed-key-in ed keymap #\w nlt:+mod-ctrl+)) "an unbound action types nothing")
+    (is (equal "alpha beta" (nle::editor-value ed)))))
+
+;;; --- undo ---------------------------------------------------------------
+
+(deftest editor-undo-takes-back-one-edit ()
+  (let ((ed (ed-make "abc")))
+    (ed-set-cursor ed 0 3)
+    (ed-key ed #\d)
+    (is (equal "abcd" (nle::editor-value ed)))
+    (is (ed-key ed #\- nlt:+mod-ctrl+) "Ctrl+- changes the text")
+    (is (equal "abc" (nle::editor-value ed)) "the edit is taken back")
+    (is (equal '(0 3) (ed-cursor ed)) "and the caret with it")
+    (is (ed-key ed #\- nlt:+mod-ctrl+))
+    (is (equal "" (nle::editor-value ed)) "the insert that built the buffer goes too")
+    (is (null (ed-key ed #\- nlt:+mod-ctrl+)) "past the first state there is nothing left")))
+
+(deftest editor-undo-takes-back-a-typed-word-at-once ()
+  ;; fish's coalescing, which pi carried: a run of word characters is one
+  ;; edit, so undo removes the word just typed rather than its last letter.
+  (let ((ed (nle::make-editor)))
+    (dolist (ch (coerce "foo bar" 'list)) (ed-key ed ch))
+    (is (equal "foo bar" (nle::editor-value ed)))
+    (is (ed-key ed #\- nlt:+mod-ctrl+))
+    (is (equal "foo" (nle::editor-value ed)) "the space and its word go in one step")
+    (is (ed-key ed #\- nlt:+mod-ctrl+))
+    (is (equal "" (nle::editor-value ed)) "then the first word")
+    (is (null (ed-key ed #\- nlt:+mod-ctrl+)) "and then there is nothing left")
+    (is (equal '(0 0) (ed-cursor ed)))))
+
+(deftest editor-undo-steps-motion-only-keys-out-of-the-way ()
+  ;; Motion is not an edit: it neither opens an undo step nor closes one.
+  (let ((ed (ed-make "abc")))
+    (ed-set-cursor ed 0 1)
+    (ed-key ed #\d nlt:+mod-ctrl+)
+    (is (equal "ac" (nle::editor-value ed)) "Ctrl+D deletes at the caret")
+    (is (null (ed-key ed :right)) "motion alone reports no text change")
+    (is (ed-key ed #\- nlt:+mod-ctrl+))
+    (is (equal "abc" (nle::editor-value ed)) "one undo takes back the one delete")))
+
+(deftest editor-reset-forgets-the-undo-history ()
+  (let ((ed (nle::make-editor)))
+    (ed-key ed #\a)
+    (nle::editor-reset ed)
+    (is (null (ed-key ed #\- nlt:+mod-ctrl+)) "a cleared composer has nothing to undo")))
+
+;;; --- the bytes a terminal really sends -----------------------------------
+;;; Every test above names a key press; these start from the bytes on the wire
+;;; and let the decoder name it. That join is where a Ctrl+_ lived for a while
+;;; as DEL -- the decoder's own test passed, the editor's own test passed, and
+;;; the gesture was dead in the gap between them.
+
+(defun ed-bytes (ed text &optional (keymap (nle::resolved-keybinds)))
+  "Feed ED the raw bytes TEXT as a terminal sends them, one key press each."
+  (with-input-from-string (stream text)
+    (loop for msg = (nlt:read-key stream nil)
+          while (and msg (nlt:key-press-msg-p msg))
+          do (nle::editor-handle-key ed msg keymap))))
+
+(deftest editor-undo-arrives-as-the-byte-a-terminal-sends-for-ctrl-underscore ()
+  ;; 0x1F is what kitty, ghostty and tmux send for Ctrl+Shift+Minus -- Ctrl+_
+  ;; on a Spanish keyboard, where `_' is Shift+`-'. It is the chord an
+  ;; operator's fingers already make, so the default keymap has to answer it.
+  (let ((ed (nle::make-editor)))
+    (ed-bytes ed "abc")
+    (is (equal "abc" (nle::editor-value ed)) "the letters type")
+    (ed-bytes ed (string (code-char 31)))
+    (is (equal "" (nle::editor-value ed)) "0x1F is the undo an operator presses")))
+
+(deftest editor-line-ends-arrive-as-esc-a-and-esc-e ()
+  ;; PINDARO's chain: xremap turns Ctrl+A into the Home keycode and the
+  ;; terminal turns Home into ESC a, so Alt+A is the only line-start the
+  ;; composer can be given -- Ctrl+A itself never leaves the OS.
+  (let ((ed (ed-make "alpha beta"))
+        (keymap (nle::resolve-keybinds '((:editor-cursor-line-start . "alt+a")
+                                         (:editor-cursor-line-end . "alt+e")))))
+    (ed-set-cursor ed 0 7)
+    (ed-bytes ed (format nil "~C~C" #\Escape #\e) keymap)
+    (is (equal '(0 10) (ed-cursor ed)) "ESC e is the line end")
+    (ed-bytes ed (format nil "~C~C" #\Escape #\a) keymap)
+    (is (equal '(0 0) (ed-cursor ed)) "ESC a is the line start")))
+
+;;; --- kills and the ring --------------------------------------------------
+
+(deftest editor-kill-and-yank-round-trip ()
+  (let ((ed (ed-make "alpha beta")))
+    (ed-set-cursor ed 0 5)
+    (is (ed-key ed #\k nlt:+mod-ctrl+) "Ctrl+K changes the text")
+    (is (equal "alpha" (nle::editor-value ed)))
+    (ed-key ed :end)
+    (is (ed-key ed #\y nlt:+mod-ctrl+) "Ctrl+Y changes it back")
+    (is (equal "alpha beta" (nle::editor-value ed)) "the killed text comes back")
+    (is (equal '(0 10) (ed-cursor ed)) "with the caret past it"))
+  ;; The ring outlives the composer it filled: a line killed before a submit is
+  ;; what the next prompt may want.
+  (let ((ed (ed-make "one two")))
+    (ed-set-cursor ed 0 3)
+    (ed-key ed #\k nlt:+mod-ctrl+)
+    (nle::editor-reset ed)
+    (ed-key ed #\y nlt:+mod-ctrl+)
+    (is (equal " two" (nle::editor-value ed)) "the ring survives a cleared buffer")))
+
+(deftest editor-kills-accumulate-into-one-ring-entry ()
+  ;; readline joins kills made back to back: two Ctrl+W take two words and
+  ;; one Ctrl+Y brings both back.
+  (let ((ed (ed-make "foo bar baz")))
+    (ed-set-cursor ed 0 11)
+    (ed-key ed #\w nlt:+mod-ctrl+)
+    (ed-key ed #\w nlt:+mod-ctrl+)
+    (is (equal "foo " (nle::editor-value ed)))
+    (ed-key ed #\y nlt:+mod-ctrl+)
+    (is (equal "foo bar baz" (nle::editor-value ed)) "two kills in a row are one entry")))
+
+(deftest editor-word-deletion-puts-the-word-on-the-ring ()
+  (let ((ed (ed-make "alpha beta")))
+    (ed-set-cursor ed 0 10)
+    (ed-key ed :backspace nlt:+mod-alt+)
+    (is (equal "alpha " (nle::editor-value ed)))
+    (ed-key ed #\y nlt:+mod-ctrl+)
+    (is (equal "alpha beta" (nle::editor-value ed)) "Alt+Backspace killed, Ctrl+Y brings it back")))
+
+(deftest editor-yank-pop-cycles-the-ring ()
+  (let ((ed (ed-make "one two")))
+    (ed-set-cursor ed 0 7)
+    (ed-key ed #\w nlt:+mod-ctrl+)       ; kills "two"
+    (ed-key ed :home)                     ; any other key ends the run of kills
+    (ed-key ed #\k nlt:+mod-ctrl+)       ; kills "one "
+    (is (equal "" (nle::editor-value ed)))
+    (is (ed-key ed #\y nlt:+mod-ctrl+))
+    (is (equal "one " (nle::editor-value ed)) "the newest kill comes back")
+    (is (ed-key ed #\y nlt:+mod-alt+) "Alt+Y cycles")
+    (is (equal "two" (nle::editor-value ed)) "the kill before it replaces it")
+    (is (ed-key ed #\y nlt:+mod-alt+))
+    (is (equal "one " (nle::editor-value ed)) "and the ring turns all the way round")
+    ;; A pop with no yank behind it is not a paste: the ring does not cycle
+    ;; into a buffer the operator was typing in.
+    (let ((other (ed-make "x")))
+      (ed-set-cursor other 0 1)
+      (is (null (ed-key other #\y nlt:+mod-alt+)))
+      (is (equal "x" (nle::editor-value other))))))

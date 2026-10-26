@@ -100,11 +100,19 @@ vaxis's parseGround decodes 0x0a the same way)."
     (8 :backspace)
     (9 :tab)
     (13 :enter)
-    (otherwise (code-char (+ (char-code char) 96)))))
+    ;; C0 is its letter 64 below: 0x01..0x1A are a..z. Above 0x1A the letter
+    ;; is capital-only (0x1C..0x1F stand for \ ] ^ _), so the lowercase 96
+    ;; offset would name DEL for 0x1F -- the byte kitty, ghostty and tmux send
+    ;; for Ctrl+_ -- and Ctrl+_ would bind nothing.
+    (otherwise (code-char (+ (char-code char) (if (>= (char-code char) 28) 64 96))))))
 
 (defun c0-key-press (char &optional (mod 0) &aux (key (ctrl-char-to-key char)))
   "The key press C0 byte CHAR stands for: its key, MOD added to the modifier
 that key carries."
+  ;; Declared, not inferred: CTRL-CHAR-TO-KEY's CASE once handed the compiler
+  ;; a range starting at 96, and the narrowed type rejected #\_ (95) at the
+  ;; first Ctrl+_ a terminal sent. Every byte of the 256 can arrive here.
+  (declare (type (or character keyword) key))
   ;; Enter and Tab carry none: outside the kitty protocol a terminal has no
   ;; way to say Ctrl+Enter, so the ctrl bit on their bytes is an artifact of
   ;; the ASCII encoding, not a gesture (vaxis reports them bare). Backspace

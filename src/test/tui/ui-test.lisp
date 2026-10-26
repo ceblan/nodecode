@@ -3401,6 +3401,79 @@ nothing opens: the target, or NIL."
       (press model #\o :mod nlt:+mod-ctrl+)
       (is (eq :developer model.tool-detail)))))
 
+(deftest keybind-document-takes-arrays-and-reports-what-it-cannot-honour ()
+  ;; pi's document shape: a chord string, or an array of them, and an empty
+  ;; array to unbind. A name no table knows, and a spec whose every chord
+  ;; fails to parse, are reported instead of dropped in silence.
+  (with-temp-file (nle::*keybinds-path*
+                   :contents "{\"editor_cursor_line_end\": [\"f1\", \"f2\"],
+                               \"help\": [], \"nope_action\": \"ctrl+g\",
+                               \"toggle_viewport\": \"wat\"}")
+    (let* ((overrides (nle::load-keybind-overrides))
+           (keymap (nle::resolve-keybinds overrides)))
+      (flet ((line-end (code) (nle::keybind-matches-p keymap :editor-cursor-line-end code 0))
+             (viewport (code) (nle::keybind-matches-p keymap :toggle-viewport code nlt:+mod-ctrl+)))
+        (is (line-end :f1) "an array binds every chord it names")
+        (is (line-end :f2) "and the second chord in it")
+        (is (not (line-end :end)) "the default it displaced goes")
+        (is (null (gethash :help keymap)) "an empty array unbinds the action")
+        (is (viewport #\o) "a spec nothing parses leaves the default standing")
+        (is (equal '(("nope_action" "no such action") ("toggle_viewport" "no key parses"))
+                   (nle::keybind-problems overrides)))))))
+
+(deftest keybind-document-names-an-action-in-either-spelling ()
+  ;; The tables spell SUBMIT_TURN_QUEUE; an operator reading /hotkeys meets
+  ;; editor_undo, and writes either. A document written in the hyphen spelling
+  ;; configured nothing at all before this.
+  (with-temp-file (nle::*keybinds-path*
+                   :contents "{\"editor-undo\": \"f9\",
+                               \"EDITOR_CURSOR_LINE_END\": [\"f10\"],
+                               \"submit-turn-queue\": \"f11\"}")
+    (let ((keymap (nle::resolve-keybinds)))
+      (is (nle::keybind-matches-p keymap :editor-undo :f9 0) "a hyphen names the action")
+      (is (nle::keybind-matches-p keymap :editor-cursor-line-end :f10 0) "so does upper case")
+      (is (nle::keybind-matches-p keymap :submit-turn-queue :f11 0) "the shell's table too")
+      (is (null (nle::keybind-problems)) "none of it is a problem"))))
+
+(deftest keybind-conflicts-name-the-two-actions-one-chord-has ()
+  (let ((keymap (nle::resolve-keybinds '((:editor-cursor-line-end . "ctrl+a")))))
+    (is (equal '((:editor-cursor-line-start :editor-cursor-line-end "Ctrl+A"))
+               (nle::keybind-conflicts keymap))))
+  ;; Two tables may share a chord freely: which one reads it is the ladder's
+  ;; business, not the keymap's.
+  (is (null (nle::keybind-conflicts (nle::resolve-keybinds '()))) "the defaults clash nowhere")
+  (is (nle::keybind-intended-share-p :submit-turn-queue :accept-suggestion) "Tab is shared on purpose"))
+
+(deftest editor-keybind-override-moves-a-composer-key ()
+  ;; The composer's chords are the keymap's like the shell's are: rebinding
+  ;; line-end in the document moves it in the shell, and the displaced default
+  ;; stops moving.
+  (with-temp-file (nle::*keybinds-path*
+                   :contents "{\"editor_cursor_line_end\": \"f1\"}")
+    (with-frame-model (model 80 24 :session-id "editor-kb")
+      (let ((ed (nle::chat-model-editor model)))
+        (type-string model "abc")
+        (press model :home)
+        (is (zerop (nle::editor-col ed)) "Home is the line start")
+        (press model :end)
+        (is (zerop (nle::editor-col ed)) "the displaced End moves nothing")
+        (press model :f1)
+        (is (= 3 (nle::editor-col ed)) "the configured chord is the line end")))))
+
+(deftest hotkeys-lists-every-action-its-chords-and-its-name ()
+  (with-frame-model (model 80 24 :session-id "hotkeys")
+    (nle::open-keybind-dialog model)
+    (let ((details (mapcar #'nle::picker-row-detail (nle::picker-dialog-rows model.dialog))))
+      (flet ((listed (needle) (find needle details :test #'search)))
+        (dolist (row (nle::keybind-action-entries))
+          (is (listed (second row)) (format nil "/hotkeys lists ~a" (first row)))
+          ;; The name is what an operator writes in keybinds.json, and this
+          ;; dialog is where it is printed.
+          (is (listed (nle::keybind-action-name (first row)))
+              (format nil "/hotkeys names ~a" (first row))))))
+    ;; The shell-free form answers the same table as text.
+    (is (search "Move to line end" (nle::slash-hotkeys-text nil nil)))))
+
 (deftest ctrl-f-expands-every-dialog-to-the-window ()
   ;; Ctrl+F over an open dialog lifts the docked panel from the Zig docked
   ;; height — and from a dialog's own BODY-ROWS — to every row under the

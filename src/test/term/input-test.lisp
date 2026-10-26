@@ -35,6 +35,15 @@
     (char= #\j 10) (char= #\a 1 "Ctrl+A is a") (char= #\c 3 "Ctrl+C is c")
     (char= #\z 26 "Ctrl+Z is z")))
 
+(deftest decoder-names-the-punctuation-c0-bytes ()
+  ;; kitty, ghostty and tmux send Ctrl+_ as 0x1F: naming it DEL left every
+  ;; undo bound to Ctrl+_ dead, and Ctrl+\ Ctrl+] Ctrl+^ with it.
+  (is (char= #\\ (nlt:ctrl-char-to-key (code-char 28))) "0x1C is Ctrl+\\")
+  (is (char= #\] (nlt:ctrl-char-to-key (code-char 29))) "0x1D is Ctrl+]")
+  (is (char= #\^ (nlt:ctrl-char-to-key (code-char 30))) "0x1E is Ctrl+^")
+  (is (char= #\_ (nlt:ctrl-char-to-key (code-char 31))) "0x1F is Ctrl+_, never DEL")
+  (is (key-is (key-from 31) #\_ :mod nlt:+mod-ctrl+) "and the byte arrives as such"))
+
 (deftest decoder-reads-plain-and-control-keys ()
   (is (key-is (key-from 97) #\a :text "a") "a graphic byte is its key with its text")
   (is (key-is (key-from 127) :backspace) "DEL is Backspace")

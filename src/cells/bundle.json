@@ -5,6 +5,7 @@
     "board": "tools/nodecode-board",
     "channels/discord": "rooms/nodecode-channel-discord",
     "channels/kit": "rooms/nodecode-channel-kit",
+    "channels/matrix": "rooms/nodecode-channel-matrix",
     "channels/slack": "rooms/nodecode-channel-slack",
     "channels/telegram": "rooms/nodecode-channel-telegram",
     "chrome": "tools/nodecode-chrome",

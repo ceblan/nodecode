@@ -1524,7 +1524,14 @@ else NIL."
              (cache-read (int "cache_read_tokens"))
              (prompt-details (or (json-value table :object "prompt_tokens_details")
                                  (json-value table :object "input_tokens_details")))
-             (cached (json-value prompt-details :integer "cached_tokens"))
+                          ;; DeepSeek's flat spelling (z.ai among them) reports the hit
+             ;; count at the top level with the prompt total still including
+             ;; it, and Kimi a flat cached_tokens; both fold like the nested
+             ;; details spelling, and REPORTED-COUNT prefers a positive report
+             ;; across the spellings a relay may emit at once.
+             (cached (reported-count (json-value prompt-details :integer "cached_tokens")
+                                     (int "prompt_cache_hit_tokens")
+                                     (int "cached_tokens")))
              ;; The responses dialect nests its cache-write count inside the same
              ;; details object that carries cached_tokens; the chat dialect keeps
              ;; it at the top level under either spelling.

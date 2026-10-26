@@ -5193,10 +5193,11 @@ at WIDTH to LINES lines, or NIL for the first row."
    ;; The one clicked-open card, group or thought's expand key (the Zig
    ;; expandedToolCallId accordion), or NIL.
    (expanded-tool-call :initform nil :accessor chat-model-expanded-tool-call)
-   ;; The resolved keymap: action keyword -> KEY-CHORD list, defaults
-   ;; overlaid with the ~/.nodecode/keybinds.json overrides once at
-   ;; model creation (keys.lisp RESOLVE-KEYBINDS).
-   (keymap :initform (resolve-keybinds) :accessor chat-model-keymap)
+   ;; The resolved keymap: action keyword -> KEY-CHORD list, both action
+   ;; tables (the shell's and the composer's) overlaid with the
+   ;; ~/.nodecode/keybinds.json overrides — keys.lisp RESOLVED-KEYBINDS, which
+   ;; answers one object until a table or the document moves.
+   (keymap :initform (resolved-keybinds) :accessor chat-model-keymap)
    ;; Collapsed pastes: (id . text) newest-last, expanded into the outgoing
    ;; prompt at submit (the Zig ComposerState.pastes).
    (pastes :initform nil :accessor chat-model-pastes)
@@ -7595,14 +7596,14 @@ when the key is none of the field's own."
   (keybind-matches-p (chat-model-keymap model) action code mod))
 
 (defun refresh-model-keymap (model)
-  "Re-resolve MODEL's keymap when it was built from another action table than
-the one now in force — what makes a keybind row (or an override) defined
-into a running image live at the next keystroke."
-  ;; One identity check per keystroke otherwise: the resolved keymap carries
-  ;; its own source table.
-  (unless (eq (gethash +keybind-source-key+ (chat-model-keymap model))
-              *keybind-actions*)
-    (setf (chat-model-keymap model) (resolve-keybinds))))
+  "Re-resolve MODEL's keymap when the action tables or the override document
+moved since it was built — what makes a keybind row defined into a running
+image, or a keybinds.json just edited, live at the next keystroke."
+  ;; One write-date stat and one EQUAL per keystroke, and a keymap that already
+  ;; carries the current stamp — one a caller resolved by hand — stands.
+  (let ((stamp (keybinds-stamp)))
+    (unless (equal stamp (gethash +keybind-source-key+ (chat-model-keymap model)))
+      (setf (chat-model-keymap model) (resolved-keybinds stamp)))))
 
 (defun composer-empty-p (model)
   "The Zig ComposerState.isEmpty gate: trimmed text empty."
@@ -10276,7 +10277,7 @@ included), then every keybind action with its resolved key label."
          collect (make-picker-row
                   :label (slash-command-label entry)
                   :detail (or (json-value entry.help-detail :text) entry.description)))
-   (loop for (action label) in *keybind-actions*
+   (loop for (action label) in (keybind-action-entries)
          collect (make-picker-row
                   :label (keybind-chords-label (chat-model-keymap model)
                                                action)
@@ -10293,6 +10294,48 @@ included), then every keybind action with its resolved key label."
                         :searchable t
                         :search-placeholder "Type to search shortcuts…"
                         :empty-label "No shortcuts found."
+                        :footer-hints :help))
+  nil)
+
+;;; The same listing without the commands: what each key does, and the two
+;;; things the document can get wrong — a name nothing answers to and a chord
+;;; two actions of one table share. pi computes both and shows neither; a
+;;; rebound key that silently does nothing is worth one dialog.
+
+(defun keybind-dialog-rows (model)
+  "Every action with its resolved chord, then the override document's
+problems, then the chords two actions of one table share."
+  (let ((keymap (chat-model-keymap model)))
+    (append
+     (loop for (action label) in (keybind-action-entries)
+           collect (make-picker-row
+                    :label (keybind-chords-label keymap action)
+                    ;; The document's spelling rides in the detail: this dialog
+                    ;; is where an operator reads what to write in
+                    ;; keybinds.json for the key they want to move.
+                    :detail (format nil "~a · ~a"
+                                    (keybind-action-name action) label)))
+     (loop for (name reason) in (keybind-problems)
+           collect (make-picker-row
+                    :label name
+                    :detail (format nil "~a in keybinds.json" reason)))
+     (loop for (first-action second-action chord) in (keybind-conflicts keymap)
+           collect (make-picker-row
+                    :label chord
+                    :detail (format nil "~a and ~a share this chord; ~a wins"
+                                    (keybind-action-name first-action)
+                                    (keybind-action-name second-action)
+                                    (keybind-action-name first-action)))))))
+
+(defun open-keybind-dialog (model)
+  "Open the keyboard dialog (/hotkeys)."
+  (let ((rows (keybind-dialog-rows model)))
+    (open-picker-dialog model (format nil "Keys (~d)" (length rows))
+                        rows
+                        nil
+                        :searchable t
+                        :search-placeholder "Type to search keys…"
+                        :empty-label "No keys found."
                         :footer-hints :help))
   nil)
 
@@ -11925,7 +11968,7 @@ from the ones COLLECT-DURING-WAIT hid inside provider wait."
     ;; walk and re-homes the dropdown selection (the Zig every-text-mutation
     ;; reset); motion alone does not.
     (when (and pass-to-editor
-               (editor-handle-key (chat-model-editor model) msg))
+               (editor-handle-key (chat-model-editor model) msg (chat-model-keymap model)))
       (reset-history-navigation model)
       (setf (chat-model-slash-selection model) 0)
       ;; A command's trigger character opens its dialog over the draft.

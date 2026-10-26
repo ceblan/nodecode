@@ -120,7 +120,7 @@ key keyword (:enter :tab :escape :backspace :delete :up :down :left
 ;;; A label is a config spelling too: spellings are matched ignoring case.
 (defparameter +key-names+
   '((:enter "Enter") (:tab "Tab") (:escape "Esc" "escape")
-    (:backspace "Backspace") (:delete "Delete" "del")
+    (:backspace "Backspace") (:delete "Delete" "del") (:insert "Insert" "ins")
     (:up "Up") (:down "Down") (:left "Left") (:right "Right") (#\Space "Space")
     (:page-up "PgUp" "pageup")
     (:page-down "PgDn" "pagedown" "pgdown")
@@ -226,52 +226,227 @@ NIL for a label naming no single key: `↑↓', `up/down', `type', prose."
     (:copy-selection "Copy selection" ("ctrl+shift+c")))
   "The declarative default keymap: (ACTION LABEL DEFAULT-CHORD-STRINGS).")
 
+;;; The composer's editing actions, in the same table shape and the same
+;;; override document: what EDITOR-HANDLE-KEY used to test as a literal, so a
+;;; move or a delete is rebindable. The ids are pi's tui.editor.* set under a
+;;; nodecode name, and the defaults are the chords that set gives an operator's
+;;; fingers — which is why Home/End here mean the line, not the transcript:
+;;; the shell reads its own scroll-home/scroll-end only while the composer is
+;;; empty, so both reach their surface.
+;;;
+;;; Two families the Zig port never had are here because the keymap made them
+;;; cheap to expose: the kill ring (Ctrl+K and Ctrl+U always killed; now the
+;;; text they took can be yanked back) and undo.
+(defparameter *editor-actions*
+  '((:editor-cursor-up "Move cursor up a row" ("up"))
+    (:editor-cursor-down "Move cursor down a row" ("down"))
+    (:editor-cursor-left "Move cursor left" ("left" "ctrl+b"))
+    (:editor-cursor-right "Move cursor right" ("right" "ctrl+f"))
+    (:editor-cursor-word-left "Move cursor a word left" ("alt+left" "ctrl+left" "alt+b"))
+    (:editor-cursor-word-right "Move cursor a word right" ("alt+right" "ctrl+right" "alt+f"))
+    (:editor-cursor-line-start "Move to line start" ("home" "ctrl+a"))
+    (:editor-cursor-line-end "Move to line end" ("end" "ctrl+e"))
+    (:editor-cursor-doc-start "Move to the start of the message" ("ctrl+home"))
+    (:editor-cursor-doc-end "Move to the end of the message" ("ctrl+end"))
+    (:editor-delete-char-backward "Delete character backward" ("backspace"))
+    (:editor-delete-char-forward "Delete character forward" ("delete" "ctrl+d"))
+    ;; Alt+Backspace and Ctrl+Delete are the spellings a terminal sends for the
+    ;; same gesture on either side of the Alt/Mod split; both are the port's.
+    (:editor-delete-word-backward "Delete word backward"
+     ("ctrl+w" "alt+backspace" "ctrl+backspace"))
+    (:editor-delete-word-forward "Delete word forward"
+     ("alt+d" "alt+delete" "ctrl+delete"))
+    (:editor-delete-to-line-start "Delete to line start" ("ctrl+u"))
+    (:editor-delete-to-line-end "Delete to line end" ("ctrl+k"))
+    (:editor-transpose-chars "Transpose the characters around the cursor" ("ctrl+t"))
+    (:editor-capitalize-word "Capitalize the word after the cursor" ("alt+c"))
+    (:editor-lowercase-word "Lowercase the word after the cursor" ("alt+l"))
+    (:editor-uppercase-word "Uppercase the word after the cursor" ("alt+u"))
+    (:editor-yank "Paste the last killed text" ("ctrl+y"))
+    (:editor-yank-pop "Cycle to an older kill" ("alt+y"))
+    ;; Ctrl+_ is the byte a terminal sends for Ctrl+- without the kitty
+    ;; protocol (0x1F), so both spellings name the one gesture there.
+    (:editor-undo "Undo the last edit" ("ctrl+-" "ctrl+_")))
+  "The composer's default keymap: (ACTION LABEL DEFAULT-CHORD-STRINGS).")
+
+(defun keybind-action-entries ()
+  "Every action row in force, the shell's before the composer's."
+  (append *keybind-actions* *editor-actions*))
+
 (define-startup-parameter *keybinds-path*
   (home "keybinds.json")
   "Where user keybind overrides live: a JSON object of action name (snake
-case, e.g. \"toggle_viewport\") to one config chord string (the Zig
-keybinds config shape). NIL disables overrides; tests bind.")
+case, e.g. \"toggle_viewport\" or \"editor_cursor_line_end\") to one
+config chord string or to an array of them — pi's keybindings.json shape. An
+empty array unbinds the action, as does \"none\"; a name no table knows is
+reported by /hotkeys. NIL disables overrides; tests bind.")
 
-(defun load-keybind-overrides ()
-  "The persisted override document as an alist (ACTION . CHORD-STRING),
-or NIL — the document keys actions by their snake-case names."
+(defun keybind-normalized-name (name)
+  "NAME in the document's spelling: lower case, snake case. The tables spell
+SUBMIT-TURN-QUEUE as `submit_turn_queue', but the same action reads as
+`editor-undo' everywhere an operator meets it — /hotkeys, a notice, this
+manual — so a document writing either is a document naming the action."
+  (substitute #\_ #\- (string-downcase (or name ""))))
+
+(defun keybind-action-name (action)
+  "ACTION's spelling in the override document: its name in snake case."
+  (keybind-normalized-name (symbol-name action)))
+
+(defun keybind-entry-name (entry)
+  "ENTRY's name in the document — an ACTION's snake case, or the name an
+unknown entry spelled."
+  (if (keywordp entry) (keybind-action-name entry) entry))
+
+(defun parse-key-spec (spec)
+  "The chords SPEC configures: one config string, or a JSON array of them.
+`:none for an empty array, or a \"none\" among them — the action unbinds —
+and NIL when nothing in SPEC parses, which leaves the defaults standing (the
+Zig fromConfigEntries skip-on-parse-failure rule)."
+  ;; pi takes a list of combos for one action and an empty list for no key at
+  ;; all; the Zig shape took one string and the word "none". Both read here —
+  ;; and an empty array has to say :none out loud, since nothing in it parses.
+  (cond
+    ((stringp spec)
+     (let ((chord (parse-key-chord spec)))
+       (cond ((eq chord :none) :none)
+             ((key-chord-p chord) (list chord)))))
+    ((and (vectorp spec) (zerop (length spec))) :none)
+    ((vectorp spec)
+     (let ((texts (coerce spec 'list)))
+       (when (every #'stringp texts)
+         (if (some (lambda (text) (eq :none (parse-key-chord text))) texts)
+             :none
+             (let ((chords (remove-if-not #'key-chord-p (mapcar #'parse-key-chord texts))))
+               (and chords chords))))))))
+
+(defun load-keybind-overrides (&aux (path *keybinds-path*))
+  "The persisted override document as an alist (ACTION . SPEC), SPEC a config
+chord string or a JSON array of them, sorted by name."
   ;; Unreadable state is ignored: keybinds are convenience, never worth
-  ;; refusing the shell over.
-  (when *keybinds-path*
+  ;; refusing the shell over. A name the tables do not know rides along as
+  ;; itself, so a typo can be reported (KEYBIND-PROBLEMS) instead of vanishing.
+  (when path
     (with-handlers ((error () nil))
-      (let ((document (nlk:decode-json (nlk:read-text *keybinds-path*))))
-        (loop for (action) in *keybind-actions*
-              for value = (json-value document :string
-                                      (substitute #\_ #\- (string-downcase (symbol-name action))))
-              when value
-                collect (cons action value))))))
-
-;;; It is how a reader tells whether a resolved keymap still speaks for the
-;;; action table now in force, which is what makes a keybind row defined into
-;;; a running image reach the keyboard at the next keystroke instead of a
-;;; relaunch (REFRESH-MODEL-KEYMAP).
-(defparameter +keybind-source-key+ :keybind-source
-  "The entry RESOLVE-KEYBINDS files its own source table under inside the
-keymap it answers — never an action name, so no reader of a chord can meet
-it.")
+      (let ((document (nlk:decode-json (nlk:read-text path))))
+        (when (hash-table-p document)
+          (let ((known (make-hash-table :test #'equal))
+                (rows '()))
+            (loop for (action) in (keybind-action-entries)
+                  do (setf (gethash (keybind-action-name action) known) action))
+            (maphash (lambda (name spec)
+                       ;; Either spelling names the action: `editor-undo' and
+                       ;; `editor_undo' are one entry to the tables.
+                       (push (cons (or (gethash (keybind-normalized-name name) known)
+                                       name)
+                                  spec)
+                             rows))
+                     document)
+            (sort rows (lambda (a b)
+                         (string-lessp (keybind-entry-name (car a))
+                                       (keybind-entry-name (car b)))))))))))
 
 (defun resolve-keybinds (&optional (overrides (load-keybind-overrides)))
   "The resolved keymap: ACTION -> list of KEY-CHORD."
-  ;; An override replaces every default chord for its action with the one
-  ;; configured spec; "none" unbinds the action; a malformed spec keeps the
-  ;; defaults (the Zig fromConfigEntries skip-on-parse-failure rule). The
-  ;; table it was built from rides along under +KEYBIND-SOURCE-KEY+.
+  ;; An override replaces every default chord for its action; "none" or `[]'
+  ;; unbinds it; a spec nothing parses keeps the defaults. An entry naming no
+  ;; action configures nothing.
   (let ((keymap (make-hash-table :test #'eq)))
-    (loop for (action nil defaults) in *keybind-actions*
+    (loop for (action nil defaults) in (keybind-action-entries)
           do (setf (gethash action keymap)
                    (remove-if-not #'key-chord-p (mapcar #'parse-key-chord defaults))))
     (loop for (action . spec) in overrides
-          for chord = (parse-key-chord spec)
-          do (cond ((eq chord :none) (setf (gethash action keymap) '()))
-                   ((key-chord-p chord)
-                    (setf (gethash action keymap) (list chord)))))
-    (setf (gethash +keybind-source-key+ keymap) *keybind-actions*)
+          for chords = (parse-key-spec spec)
+          when (keywordp action)
+            do (cond ((eq chords :none) (setf (gethash action keymap) '()))
+                     (chords (setf (gethash action keymap) chords))))
+    (setf (gethash +keybind-source-key+ keymap) (keybinds-stamp))
     keymap))
+
+(defun key-chord-canonical (chord)
+  "CHORD as a value two equal gestures share: a letter's case stands in for
+shift (KEYBIND-MATCHES-P's rule), so Alt+A and Alt+Shift+A are one chord."
+  (list (if (and (characterp chord.code) (alpha-char-p chord.code))
+            (char-downcase chord.code)
+            chord.code)
+        (and chord.ctrl t) (and chord.alt t) (and chord.shift t)))
+
+(defparameter +keybind-intended-shares+
+  '((:submit-turn-queue . :accept-suggestion))
+  "The pairs one table binds to one chord on purpose: the shell's ladder reads
+Tab by context (it queues only while a turn runs), so a shared chord there is
+the design, not a mistake.")
+
+(defun keybind-intended-share-p (first-action second-action)
+  "Whether the two actions share a chord by design."
+  (flet ((row-p (row) (and (eq (car row) first-action) (eq (cdr row) second-action))))
+    (or (some #'row-p +keybind-intended-shares+)
+        (some (lambda (row) (and (eq (car row) second-action) (eq (cdr row) first-action)))
+              +keybind-intended-shares+))))
+
+(defun keybind-conflicts (keymap)
+  "The chords KEYMAP binds to two actions of one table: an override may make a
+clash its table has no precedence for, so the earlier row is all that fires.
+=> (FIRST-ACTION SECOND-ACTION CHORD-LABEL), shell clashes then composer ones.
+The two tables may share a chord freely — which table reads a key is the
+ladder's business, not the keymap's."
+  (loop for table in (list *keybind-actions* *editor-actions*)
+        nconc (let ((owner (make-hash-table :test #'equal))
+                    (clashes '()))
+                (dolist (row table (nreverse clashes))
+                  (dolist (chord (gethash (first row) keymap))
+                    (let ((other (gethash (key-chord-canonical chord) owner)))
+                      (when (and other
+                                 (not (eq other (first row)))
+                                 (not (keybind-intended-share-p other (first row))))
+                        (push (list other (first row) (key-chord-label chord)) clashes))
+                      (setf (gethash (key-chord-canonical chord) owner) (first row))))))))
+
+(defun keybind-problems (&optional (overrides (load-keybind-overrides)))
+  "What the override document says the keymap cannot honour: a name no table
+knows, a spec whose every chord fails to parse. => (NAME REASON) rows."
+  (loop for (entry . spec) in overrides
+        if (not (keywordp entry))
+          collect (list entry "no such action")
+        else when (null (parse-key-spec spec))
+          collect (list (keybind-entry-name entry) "no key parses")))
+
+(defun keybind-document-stamp (path)
+  "What the document at PATH looked like: its write date and its size. The
+write date alone is a whole second, and a script editing keybinds.json twice
+inside one second would leave the keymap reading the first version."
+  (when path
+    (ignore-errors
+      (list (file-write-date path)
+            (with-open-file (in path :element-type '(unsigned-byte 8))
+              (file-length in))))))
+
+(defun keybinds-stamp ()
+  "What a resolved keymap is a function of: the two action tables in force and
+the override document's stamp — so an edited keybinds.json, or a keybind row
+defined into a running image, lands at the next keystroke."
+  (list *keybind-actions* *editor-actions* *keybinds-path*
+        (keybind-document-stamp *keybinds-path*)))
+
+(defparameter +keybind-source-key+ :keybind-source
+  "The entry a resolved keymap files its own KEYBINDS-STAMP under — never an
+action name, so no reader of a chord can meet it. It is how a reader tells
+whether that keymap still speaks for the tables and the document now in
+force, which is what makes a keybind row defined into a running image, or a
+keybinds.json just edited, reach the keyboard at the next keystroke instead
+of a relaunch (REFRESH-MODEL-KEYMAP). A keymap whose stamp already matches is
+the caller's own — a test, a cell — and is left alone.")
+
+(defvar *resolved-keybinds* nil
+  "The (STAMP . KEYMAP) the tables and the document last resolved to.")
+
+(defun resolved-keybinds (&optional (stamp (keybinds-stamp)))
+  "KEYMAP for the action tables and override document now in force, re-resolved
+only when one of them changed: a keystroke pays one EQUAL, not a resolve."
+  (if (and *resolved-keybinds* (equal (car *resolved-keybinds*) stamp))
+      (cdr *resolved-keybinds*)
+      (let ((keymap (resolve-keybinds)))
+        (setf *resolved-keybinds* (cons stamp keymap))
+        keymap)))
 
 ;;; The chord table above is written against the decoder the Zig TUI reads
 ;;; through (vaxis Parser.parseGround) and the core's decoder agrees with

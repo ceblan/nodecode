@@ -47,7 +47,19 @@
   (offset 0 :type fixnum)
   (placeholder "")
   (char-limit 0 :type fixnum)
+  ;; The Zig port's, then the two the keymap made worth carrying: UNDO is the
+  ;; stack of states an undo returns to, KILL-RING the text the kill commands
+  ;; took (newest first), LAST-ACTION what the previous key did — a kill after
+  ;; a kill joins the ring entry, a yank-pop after a yank rewrites it — and
+  ;; YANK-START/END the span the last yank wrote, which a yank-pop replaces.
   (epoch 0 :type fixnum)
+  ;; UNDO-STACK, not UNDO: the record derives EDITOR-<SLOT>, and EDITOR-UNDO
+  ;; is the command that pops this one.
+  (undo-stack '())
+  (kill-ring '())
+  (last-action nil)
+  (yank-start nil)
+  (yank-end nil)
   (value-memo nil)
   (visual-memo nil))
 
@@ -57,10 +69,55 @@
   (incf editor.epoch)
   editor)
 
+;;; --- undo ----------------------------------------------------------------
+;;; One checkpoint per EDIT, not per primitive: the state before an edit's
+;;; first mutation, pushed once however many splicings the edit passes
+;;; through. A run of typed word characters is one edit (fish's rule), so
+;;; Ctrl+- takes back a word and not a letter.
+
+(defparameter *editor-undo-limit* 200
+  "How many edits one composer remembers; the oldest fall off. pi keeps every
+one, which a shell open for a day cannot afford.")
+
+(defvar *editor-editing* nil
+  "How deep the mutation in progress is: the outermost one checkpoints.")
+
+(defun %editor-snapshot (editor)
+  "EDITOR's state as a value the buffer cannot mutate through."
+  ;; The line vector is copied and the caret is a pair, no cons shared with
+  ;; the live record. A line itself is safe to share: every mutation REPLACES
+  ;; a line, none writes through one.
+  (list (copy-seq editor.lines) editor.row editor.col))
+
+(defun %editor-restore (editor snapshot)
+  "Put EDITOR back on SNAPSHOT."
+  (destructuring-bind (lines row col) snapshot
+    (setf editor.lines lines
+          editor.row row
+          editor.col col)
+    (%editor-touch editor)))
+
+(defun %editor-checkpoint (editor)
+  "Remember the state an undo returns to."
+  (push (%editor-snapshot editor) editor.undo-stack)
+  (when (> (length editor.undo-stack) *editor-undo-limit*)
+    (setf (cdr (nthcdr (1- *editor-undo-limit*) editor.undo-stack)) nil))
+  editor)
+
+(defmacro %editor-edit ((editor) &body body)
+  "BODY mutates EDITOR's buffer as one undoable edit: the outermost mutation
+pushes the checkpoint undo returns to, the ones it calls ride on it."
+  `(if *editor-editing*
+       (progn ,@body)
+       (progn (%editor-checkpoint ,editor)
+              (let ((*editor-editing* t))
+                ,@body))))
+
 (defun %editor-set-lines (editor start end rows &aux (lines editor.lines))
   "Replace logical lines START..END with the strings ROWS."
-  (setf editor.lines (concatenate 'vector (subseq lines 0 start) rows (subseq lines end)))
-  editor)
+  (%editor-edit (editor)
+    (setf editor.lines (concatenate 'vector (subseq lines 0 start) rows (subseq lines end)))
+    editor))
 
 (defun frame-lines (text)
   "TEXT split on newlines, keeping empty rows."
@@ -121,6 +178,13 @@ was when that answer was made, else BODY, stored back under the fresh fields."
   (setf editor.row 0
         editor.col 0
         editor.offset 0)
+  ;; A cleared composer has nothing to undo back to, and nothing to yank-pop
+  ;; over: the ring itself is kept, since the line killed before a submit is
+  ;; what the next prompt may want.
+  (setf editor.undo-stack '()
+        editor.last-action nil
+        editor.yank-start nil
+        editor.yank-end nil)
   (%editor-touch editor))
 
 (defun editor-insert (editor text)
@@ -147,14 +211,68 @@ splits the line."
         (%editor-touch editor))))
   editor)
 
+(defun editor-type-char (editor char &key previous)
+  "Insert the typed CHAR as part of the word being typed: a run of word
+characters is one undo step (fish's rule, pi's), and a blank starts a new one."
+  (if (and (eq previous :type)
+           (not (member char '(#\Space #\Tab #\Newline))))
+      ;; Riding the previous keystroke's checkpoint is what makes the run one
+      ;; step: the edit still happens, it just does not open a new one.
+      (let ((*editor-editing* t))
+        (editor-insert editor (string char)))
+      (editor-insert editor (string char)))
+  (setf editor.last-action :type)
+  editor)
+
 ;;; --- deletion ------------------------------------------------------------
 
-(defun %editor-splice (editor start end &optional (text ""))
-  "Replace characters START..END of the caret's line with TEXT."
-  (let ((line (%editor-current-line editor)))
-    (setf (aref editor.lines editor.row)
-          (concatenate 'string (subseq line 0 start) text (subseq line end))))
-  (%editor-touch editor))
+(defun %editor-splice (editor start end &optional (text "") (row editor.row))
+  "Replace characters START..END of ROW's line with TEXT."
+  (%editor-edit (editor)
+    (let ((line (aref editor.lines row)))
+      (setf (aref editor.lines row)
+            (concatenate 'string (subseq line 0 start) text (subseq line end))))
+    (%editor-touch editor)))
+
+(defun editor-delete-char-forward (editor)
+  "Delete the character at the caret (Delete, Ctrl+D); at a line end it joins
+the next line on."
+  (cond ((< editor.col (length (%editor-current-line editor)))
+         (%editor-splice editor editor.col (1+ editor.col)))
+        ((< editor.row (1- (editor-line-count editor)))
+         (%editor-set-lines editor editor.row (+ editor.row 2)
+                            (list (concatenate 'string (aref editor.lines editor.row)
+                                               (aref editor.lines (1+ editor.row)))))
+         (%editor-touch editor)))
+  editor)
+
+(defun editor-delete-char-backward (editor)
+  "Delete the character before the caret (Backspace): the caret steps left,
+then deletes there, so a line start joins the line onto the one above."
+  (when (or (plusp editor.col) (plusp editor.row))
+    (editor-cursor-left editor)
+    (editor-delete-char-forward editor))
+  editor)
+
+(defun editor-delete-to-line-end (editor &key accumulate)
+  "Kill from the caret to the line end (Ctrl+K)."
+  (editor-kill editor editor.col (length (%editor-current-line editor))
+               :accumulate accumulate))
+
+(defun editor-delete-to-line-start (editor &key accumulate)
+  "Kill from the line start to the caret (Ctrl+U); on a line the caret has
+already emptied, take the line itself — never the last one."
+  (cond ((plusp editor.col)
+         (editor-kill editor 0 editor.col :prepend t :accumulate accumulate))
+        ((and (zerop (length (%editor-current-line editor)))
+              (> (editor-line-count editor) 1))
+         ;; Remove just this empty logical line, not its neighbors.
+         (%editor-set-lines editor editor.row (1+ editor.row) nil)
+         (when (plusp editor.row)
+           (decf editor.row)
+           (editor-cursor-end editor))
+         (%editor-touch editor)))
+  editor)
 
 ;;; --- caret motion --------------------------------------------------------
 
@@ -178,6 +296,97 @@ splits the line."
         ((< editor.row (1- (editor-line-count editor))) (incf editor.row) (setf editor.col 0)))
   editor)
 
+;;; --- kills, the ring and undo --------------------------------------------
+;;; Readline's kill ring: a delete that takes more than one character
+;;; remembers what it took, and Ctrl+Y puts it back. The Zig port had half of
+;;; this — Ctrl+K and Ctrl+W killed, and the text was gone for good.
+
+(defparameter *kill-ring-limit* 32
+  "How many kills one composer remembers.")
+
+(defun %editor-kill-push (editor text &key prepend accumulate)
+  "Remember TEXT as killed from EDITOR. ACCUMULATE joins the newest entry — a
+kill right after a kill is one kill, as readline's is — and PREPEND puts TEXT
+before it rather than after."
+  (when (plusp (length text))
+    (cond ((and accumulate editor.kill-ring)
+           (setf (first editor.kill-ring)
+                 (if prepend
+                     (concatenate 'string text (first editor.kill-ring))
+                     (concatenate 'string (first editor.kill-ring) text))))
+          (t
+           (push text editor.kill-ring)
+           (when (> (length editor.kill-ring) *kill-ring-limit*)
+             (setf (cdr (nthcdr (1- *kill-ring-limit*) editor.kill-ring)) nil)))))
+  editor)
+
+(defun editor-kill (editor start end &key prepend accumulate)
+  "Delete characters START..END of the caret's line as a kill: the text joins
+the ring (joining the kill before it when ACCUMULATE) and the caret stands at
+START."
+  (let ((text (subseq (%editor-current-line editor) start end)))
+    (when (plusp (length text))
+      (%editor-splice editor start end)
+      (setf editor.col start)
+      (%editor-kill-push editor text :prepend prepend :accumulate accumulate)
+      (setf editor.last-action :kill)))
+  editor)
+
+(defun %editor-delete-span (editor start end)
+  "Delete the text between two (ROW . COL) points, joining the lines a span
+across lines ends in."
+  (destructuring-bind (start-row . start-col) start
+    (if (= start-row (car end))
+        (progn (%editor-splice editor start-col (cdr end) "" start-row)
+               (setf editor.row start-row
+                     editor.col start-col))
+        (%editor-edit (editor)
+          (%editor-set-lines editor start-row (1+ (car end))
+                             (list (concatenate 'string
+                                                (subseq (aref editor.lines start-row) 0 start-col)
+                                                (subseq (aref editor.lines (car end)) (cdr end)))))
+          (setf editor.row start-row
+                editor.col start-col)
+          (%editor-touch editor))))
+  editor)
+
+(defun editor-yank (editor)
+  "Insert the newest kill at the caret (Ctrl+Y), the caret past it."
+  (when editor.kill-ring
+    (let ((start (cons editor.row editor.col)))
+      (editor-insert editor (first editor.kill-ring))
+      (setf editor.yank-start start
+            editor.yank-end (cons editor.row editor.col)
+            editor.last-action :yank)))
+  editor)
+
+(defun editor-yank-pop (editor &key previous)
+  "Replace the last yank with the kill before it (Alt+Y), cycling the ring.
+PREVIOUS is what the previous key did: a pop follows a yank and nothing else."
+  (when (and (eq previous :yank) editor.yank-start (> (length editor.kill-ring) 1))
+    ;; A pop refines the yank it follows rather than adding a step of its own,
+    ;; so the undo the pair leaves behind takes back the whole yank.
+    (let ((*editor-editing* t))
+      (%editor-delete-span editor editor.yank-start editor.yank-end)
+      ;; The entry just yanked takes the oldest place and the next-newest comes
+      ;; up, which is readline's ring turning under one chord.
+      (setf editor.kill-ring (append (rest editor.kill-ring) (list (first editor.kill-ring))))
+      (let ((start (cons editor.row editor.col)))
+        (editor-insert editor (first editor.kill-ring))
+        (setf editor.yank-start start
+              editor.yank-end (cons editor.row editor.col))))
+    (setf editor.last-action :yank))
+  editor)
+
+(defun editor-undo (editor)
+  "Step back one edit (Ctrl+-): the state a checkpoint remembered."
+  (when-let (snapshot (pop editor.undo-stack))
+    (%editor-restore editor snapshot)
+    (setf editor.last-action nil
+          editor.yank-start nil
+          editor.yank-end nil))
+  editor)
+
 ;;; --- words ---------------------------------------------------------------
 ;;; A word character is alphanumeric, the readline convention.
 
@@ -192,18 +401,24 @@ or the line end."
   (let ((end (or (position-if-not #'alphanumericp line :start i) n)))
     (or (position-if #'alphanumericp line :start end) n)))
 
-(defun editor-word (editor direction &key delete &aux (col editor.col)
-                                                      (line (%editor-current-line editor)))
+(defun editor-word (editor direction &key delete accumulate &aux (col editor.col)
+                                                       (line (%editor-current-line editor)))
   "Caret to the start of the previous word (DIRECTION -1) or past the current
-word, or to the line end (DIRECTION 1); with DELETE, delete that word instead
-(readline Ctrl+W / Alt+Backspace, Alt+D / Ctrl+Delete), the caret at its start."
+word, or to the line end (DIRECTION 1); with DELETE, kill that word instead
+(readline Ctrl+W / Alt+Backspace, Alt+D / Ctrl+Delete), the caret at its
+start and the text on the kill ring — ACCUMULATE joins it to the kill before."
   (let ((to (if (minusp direction)
                 (%prev-word-boundary line col)
                 (%next-word-boundary line col))))
     (cond ((not delete) (setf editor.col to))
           ((/= to col)
-           (%editor-splice editor (min to col) (max to col))
-           (setf editor.col (min to col)))))
+           (let ((text (subseq line (min to col) (max to col))))
+             (%editor-splice editor (min to col) (max to col))
+             (setf editor.col (min to col))
+             (%editor-kill-push editor text
+                                :prepend (minusp direction)
+                                :accumulate accumulate)
+             (setf editor.last-action :kill)))))
   editor)
 
 (defun editor-transpose-chars (editor &aux (line (%editor-current-line editor))
@@ -324,79 +539,68 @@ in display columns from the left edge, Y in rows from the top visible row."
 
 ;;; --- keys ----------------------------------------------------------------
 
-(defun editor-handle-key (editor msg &aux (before editor.epoch))
-  "Apply the key press MSG to EDITOR: the arrows and Home/End, the readline
-motion, kill and word chords, Backspace/Delete, Enter (and its Ctrl+M /
-Ctrl+J spellings) as a newline, and plain characters as text."
-  ;; A ctrl or alt chord this table does not name is a gesture, not text: it
-  ;; never types its base letter. => T when the text changed; motion alone
-  ;; answers NIL.
+(defun editor-handle-key (editor msg &optional (keymap (resolved-keybinds))
+                           &aux (before editor.epoch))
+  "Apply the key press MSG to EDITOR under KEYMAP: the composer's motion, kill,
+yank, undo and case actions, Enter (and its Ctrl+M / Ctrl+J spellings) as a
+newline, and plain characters as text."
+  ;; A chord the table does not name is a gesture, not text: it never types its
+  ;; base letter. Every key clears LAST-ACTION but the three arms that read it:
+  ;; a kill joins the kill before it, a yank-pop follows a yank, and a run of
+  ;; typed word characters is one undo step.
+  ;; => T when the text changed; motion alone answers NIL.
   (when (nlt:key-press-msg-p msg)
     (let* ((key (nlt:key-event-code msg))
            (mod (nlt:key-event-mod msg))
            (ctrl (nlt:mod-contains mod nlt:+mod-ctrl+))
-           (alt (nlt:mod-contains mod nlt:+mod-alt+)))
-      (flet ((chord (char) (and (characterp key) (char= key char))))
+           (alt (nlt:mod-contains mod nlt:+mod-alt+))
+           (last editor.last-action))
+      (setf editor.last-action nil)
+      ;; The order is the precedence a clash between two actions of this table
+      ;; resolves by: what takes a modifier and a longer span first, so a chord
+      ;; moved onto a bare key still means what it said.
+      (flet ((chord (char) (and (characterp key) (char= key char)))
+             (match (action) (keybind-matches-p keymap action key mod)))
         (cond
-          ;; Word motion first: Ctrl/Alt + arrow outranks the plain arrow.
-          ((or (and (or ctrl alt) (eq key :left)) (and alt (chord #\b))) (editor-word editor -1))
-          ((or (and (or ctrl alt) (eq key :right)) (and alt (chord #\f))) (editor-word editor 1))
-          ;; Up/Down step one VISUAL row, keeping the caret's offset
-          ;; within it: a logical line wider than WIDTH occupies several
-          ;; visual rows, and stepping the logical row instead would jump
-          ;; the caret past every wrapped row of it.
-          ((eq key :up) (%editor-visual-step editor -1))
-          ((eq key :down) (%editor-visual-step editor 1))
-          ((or (eq key :left) (and ctrl (chord #\b))) (editor-cursor-left editor))
-          ((or (eq key :right) (and ctrl (chord #\f))) (editor-cursor-right editor))
-          ;; Document begin/end outrank line start/end below.
-          ((and ctrl (eq key :home)) (setf editor.row 0 editor.col 0))
-          ((and ctrl (eq key :end))
+          ((match :editor-undo) (editor-undo editor))
+          ((match :editor-yank-pop) (editor-yank-pop editor :previous last))
+          ((match :editor-yank) (editor-yank editor))
+          ((match :editor-delete-word-backward)
+           (editor-word editor -1 :delete t :accumulate (eq last :kill)))
+          ((match :editor-delete-word-forward)
+           (editor-word editor 1 :delete t :accumulate (eq last :kill)))
+          ((match :editor-delete-to-line-start)
+           (editor-delete-to-line-start editor :accumulate (eq last :kill)))
+          ((match :editor-delete-to-line-end)
+           (editor-delete-to-line-end editor :accumulate (eq last :kill)))
+          ((match :editor-delete-char-forward) (editor-delete-char-forward editor))
+          ((match :editor-delete-char-backward) (editor-delete-char-backward editor))
+          ((match :editor-cursor-word-left) (editor-word editor -1))
+          ((match :editor-cursor-word-right) (editor-word editor 1))
+          ((match :editor-cursor-doc-start) (setf editor.row 0 editor.col 0))
+          ((match :editor-cursor-doc-end)
            (setf editor.row (1- (editor-line-count editor)))
            (editor-cursor-end editor))
-          ((or (and ctrl (chord #\w)) (and (or ctrl alt) (eq key :backspace)))
-           (editor-word editor -1 :delete t))
-          ((or (and alt (chord #\d)) (and (or ctrl alt) (eq key :delete)))
-           (editor-word editor 1 :delete t))
-          ((and ctrl (chord #\t)) (editor-transpose-chars editor))
+          ((match :editor-cursor-line-start) (setf editor.col 0))
+          ((match :editor-cursor-line-end) (editor-cursor-end editor))
+          ;; Up/Down step one VISUAL row, keeping the caret's offset within it:
+          ;; a logical line wider than WIDTH occupies several visual rows, and
+          ;; stepping the logical row instead would jump the caret past every
+          ;; wrapped row of it.
+          ((match :editor-cursor-up) (%editor-visual-step editor -1))
+          ((match :editor-cursor-down) (%editor-visual-step editor 1))
+          ((match :editor-cursor-left) (editor-cursor-left editor))
+          ((match :editor-cursor-right) (editor-cursor-right editor))
+          ((match :editor-transpose-chars) (editor-transpose-chars editor))
           ;; readline Alt+C, Alt+L and Alt+U
-          ((and alt (chord #\c)) (editor-case-word editor #'string-capitalize))
-          ((and alt (chord #\l)) (editor-case-word editor #'string-downcase))
-          ((and alt (chord #\u)) (editor-case-word editor #'string-upcase))
-          ((or (eq key :home) (and ctrl (chord #\a))) (setf editor.col 0))
-          ((or (eq key :end) (and ctrl (chord #\e))) (editor-cursor-end editor))
-          ;; Backspace steps the caret left, then deletes at it as Delete does.
-          ((or (eq key :delete) (and ctrl (chord #\d))
-               (and (eq key :backspace)
-                    (or (plusp (editor-col editor)) (plusp (editor-row editor)))
-                    (editor-cursor-left editor)))
-           (cond ((< editor.col (length (aref editor.lines editor.row)))
-                  (%editor-splice editor editor.col (1+ editor.col)))
-                 ((< editor.row (1- (editor-line-count editor)))
-                  (%editor-set-lines editor editor.row (+ editor.row 2)
-                                     (list (concatenate 'string (aref editor.lines editor.row)
-                                                        (aref editor.lines (1+ editor.row)))))
-                  (%editor-touch editor))))
-          ;; Ctrl+J is the raw LF byte and Ctrl+M the raw CR byte: both are
-          ;; the readline newline chord.
+          ((match :editor-capitalize-word) (editor-case-word editor #'string-capitalize))
+          ((match :editor-lowercase-word) (editor-case-word editor #'string-downcase))
+          ((match :editor-uppercase-word) (editor-case-word editor #'string-upcase))
+          ;; Ctrl+J is the raw LF byte and Ctrl+M the raw CR byte: both are the
+          ;; readline newline chord. The shell reads its own newline action
+          ;; ahead of this, so what reaches here is a shell that passed Enter on.
           ((or (eq key :enter) (and ctrl (or (chord #\m) (chord #\j))))
            (editor-insert editor (string #\Newline)))
-          ((and ctrl (chord #\k))
-           (let ((end (length (%editor-current-line editor))))
-             (when (< editor.col end)
-               (%editor-splice editor editor.col end))))
-          ((and ctrl (chord #\u))
-           (cond ((plusp editor.col)
-                  (%editor-splice editor 0 editor.col)
-                  (setf editor.col 0))
-                 ((and (zerop (length (%editor-current-line editor)))
-                       (> (editor-line-count editor) 1))
-                  ;; Remove just this empty logical line, not its neighbors.
-                  (%editor-set-lines editor editor.row (1+ editor.row) nil)
-                  (when (plusp editor.row)
-                    (decf editor.row)
-                    (editor-cursor-end editor))
-                  (%editor-touch editor))))
           ((and (characterp key) (not ctrl) (not alt))
-           (editor-insert editor (string key)))))))
+           (editor-type-char editor key :previous last))))))
   (/= before editor.epoch))

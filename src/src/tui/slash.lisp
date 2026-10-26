@@ -69,6 +69,13 @@
   (list (make-slash-command "help" "Show commands and key bindings"
                             :op 'open-help-dialog :headless 'slash-help-text :keybind :help
                             :session nil)
+        ;; The keymap's own listing. /help answers the commands AND the keys;
+        ;; this one answers the keys alone, with the two things the override
+        ;; document can get wrong, which is what an operator rebinding a
+        ;; chord is looking at.
+        (make-slash-command "hotkeys" "Show every key binding, and any that clash"
+                            :op 'open-keybind-dialog :headless 'slash-hotkeys-text
+                            :session nil)
         (make-slash-command "clear" "Start a fresh session"
                             :aliases '("new") :headless 'headless-clear)
         (make-slash-command "sessions" "Pick a session and switch to it" :keybind :sessions-dialog

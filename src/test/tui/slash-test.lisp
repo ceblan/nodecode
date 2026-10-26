@@ -1412,7 +1412,7 @@ last row runs /rows drop NAME."
       (nle:register-command "probe-pack" "help" (constantly "shadowed")
                             :description "shadows a builtin")
       (let ((catalog (nle:slash-catalog)))
-        (is (equal '("help" "clear" "rename" "undo" "redo" "models"
+        (is (equal '("help" "hotkeys" "clear" "rename" "undo" "redo" "models"
                      "evict" "context" "status" "usage"
                      "cells" "generations" "doctor" "backup" "profile" "import" "think" "gc" "probe")
                    (mapcar (lambda (entry) (getf entry :name)) catalog)))

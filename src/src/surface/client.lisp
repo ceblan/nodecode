@@ -5949,6 +5949,16 @@ cell's."
                                     (format nil "/~a" (getf entry :name)))
                                 (getf entry :description)))))
 
+(defun slash-hotkeys-text (args session-id)
+  "Every bound key as text, one action per line — the shell-free /hotkeys."
+  (declare (ignore args session-id))
+  (let ((keymap (resolved-keybinds)))
+    (format nil "~{~a~^~%~}"
+            (loop for (action label) in (keybind-action-entries)
+                  for chords = (keybind-chords-label keymap action :unbound nil)
+                  when (and chords (plusp (length chords)))
+                    collect (format nil "~a — ~a" chords label)))))
+
 (defun require-headless-session (session-id name)
   (unless (stringp session-id)
     (error "/~a has no ambient session here — pass :session-id \"s-...\"" name))
