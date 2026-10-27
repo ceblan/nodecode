@@ -725,14 +725,15 @@ writer."
 
 (defun hub-index-text (&rest entries)
   "A format-1 hub index of ENTRIES, each a plist of NAME GIT COMMIT and the
-optional PATH, PLATFORMS and DEPENDS-ON."
+optional PATH, PLATFORMS, DEPENDS-ON, ARCHIVE and SHA256."
   (format nil "{\"format\": 1, \"cells\": [~{~a~^, ~}]}"
           (loop for entry in entries
-                collect (destructuring-bind (&key name git commit path platforms depends-on) entry
+                collect (destructuring-bind (&key name git commit path platforms depends-on archive sha256) entry
                           (format nil "{\"name\": ~s, \"git\": ~s, \"commit\": ~s, \"description\": \"d\"~
                                      ~@[, \"path\": ~s~]~@[, \"platforms\": [~{~s~^, ~}]~]~
-                                     ~@[, \"depends_on\": [~{~s~^, ~}]~]}"
-                                  name git commit path platforms depends-on)))))
+                                     ~@[, \"depends_on\": [~{~s~^, ~}]~]~
+                                     ~@[, \"archive\": ~s~]~@[, \"sha256\": ~s~]}"
+                                  name git commit path platforms depends-on archive sha256)))))
 
 (deftest cells-hub-index-reads-pinned-entries-and-refuses-a-loose-one ()
   ;; An entry clones from https:// only and pins a full commit: a branch or a
@@ -764,7 +765,15 @@ optional PATH, PLATFORMS and DEPENDS-ON."
       ;; a path is a folder inside the repository, never out of it or into .git
       (dolist (path '("../up" "/abs" "a/../b" ".git/x" "a//b" "a/"))
         (is (search "path is a folder" (refused :name "nl-hub-a" :git git :commit commit :path path))
-            path)))
+            path))
+      ;; an archive is https:// and comes with the sha256 its bytes must have
+      (let ((sha (make-string 64 :initial-element #\0)))
+        (is (search "archive is" (refused :name "nl-hub-a" :git git :commit commit :path "a" :archive "http://example.org/a.tar.gz" :sha256 sha)) "not over plain http")
+        (is (search "archive is" (refused :name "nl-hub-a" :git git :commit commit :path "a" :archive "https://example.org/a.tar.gz")) "not without its sha256")
+        (is (search "archive is" (refused :name "nl-hub-a" :git git :commit commit :path "a" :sha256 sha)) "nor a sha256 alone")
+        (let ((entry (first (nlk:read-hub-index (hub-index-text (list :name "nl-hub-a" :git git :commit commit :path "a" :archive "https://example.org/a.tar.gz" :sha256 sha)) :shipped '()))))
+          (is (equal "https://example.org/a.tar.gz" (nlk::offer-archive entry)) "the archive is read")
+          (is (equal sha (nlk::offer-sha256 entry)) "beside its sha256"))))
     (is (search "format 1" (refusal-text error (nlk:read-hub-index "{\"format\": 2, \"cells\": []}"))))))
 
 (defun hub-fixture-repository (parent folder &optional (prepare #'identity))
@@ -854,6 +863,30 @@ from GIT at COMMIT; KEYS come first, so they win."
             (is (search "has no folder elsewhere/nl-hub-out" through-a-link) "a path out through a link"))
           (is (null (nlk::cell-folders root)) "a refused clone leaves nothing to load")
           (is (probe-file (merge-pathnames "nl-hub-out/nl-hub-out.asd" outside)) "and moves nothing out of place"))))))
+
+(deftest cells-hub-folders-of-one-repository-come-out-of-one-kept-copy ()
+  ;; Folders of one repository at one commit fetch it once: the first pick
+  ;; fills the copy the home keeps, and the next needs no network -- here,
+  ;; no remote at all.
+  (with-temp-trees ((remote "hub-kept-remote") (home "hub-kept-home"))
+    (let ((root (merge-pathnames "cells/" home)))
+      (multiple-value-bind (git commit)
+          (hub-fixture-repository remote "nl-hub-kept"
+                                  (lambda (folder &aux (cells (merge-pathnames "cells/" folder)))
+                                    (write-peripheral-folder cells "nl-hub-k1")
+                                    (write-peripheral-folder cells "nl-hub-k2")))
+        (flet ((entry (name) (hub-offer name git commit :path (format nil "cells/~a" name))))
+          (is (hub-install (entry "nl-hub-k1") root) "the first pick fetches")
+          (nlk:remove-tree (merge-pathnames "nl-hub-kept/" remote))
+          (is (hub-install (entry "nl-hub-k2") root) "the next one has no remote to fetch from")
+          (dolist (name '("nl-hub-k1" "nl-hub-k2"))
+            (let ((folder (merge-pathnames (format nil "~a/" name) root)))
+              (is (probe-file (merge-pathnames (format nil "~a.asd" name) folder)))
+              (is (null (probe-file (merge-pathnames ".git/" folder))) "the folder alone")
+              (is (equal (list git commit (format nil "cells/~a" name))
+                         (uiop:read-file-lines (merge-pathnames ".hub" folder))))))
+          (is (null (probe-file (merge-pathnames ".cell-staging/" home))) "the staging folder goes")
+          (is (= 2 (length (nlk::cell-folders root))) "both folders, and nothing else, moved in"))))))
 
 #-win32
 (deftest cells-hub-entry-carrying-a-symbolic-link-is-refused ()

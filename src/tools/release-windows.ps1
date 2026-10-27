@@ -40,12 +40,27 @@ $scratchCache = Join-Path $Work 'cache'
 $scratchTemp = Join-Path $Work 'temp'
 New-Item -ItemType Directory -Force $scratchHome, $scratchCache, $scratchTemp | Out-Null
 # windows-release.lisp finds quicklisp under (user-homedir-pathname), which SBCL
-# reads off USERPROFILE: the scratch home gets the dependency tree as a
+# reads off HOME (set below): the scratch home gets the dependency tree as a
 # junction, never a copy -- the same quicklisp dist the Linux build compiles
 # against -- and nothing else of this user's.
-New-Item -ItemType Junction -Path (Join-Path $scratchHome 'quicklisp') `
-  -Target (Join-Path $env:USERPROFILE 'quicklisp') | Out-Null
+# The tree itself sits at a path that names nobody, C:\nodecode-build\quicklisp,
+# copied once from this user's: SBCL writes the true path of every library it
+# compiles into the image, and a junction into C:\Users\<account> put that
+# account's name in every release. The gate before the zip checks it.
+$accountHome = $env:USERPROFILE
+$neutralQl = 'C:\nodecode-build\quicklisp'
+if (-not (Test-Path (Join-Path $neutralQl 'setup.lisp'))) {
+  New-Item -ItemType Directory -Force (Split-Path -Parent $neutralQl) | Out-Null
+  robocopy (Join-Path $accountHome 'quicklisp') $neutralQl /E /NFL /NDL /NJH /NJS /NP | Out-Null
+  if ($LASTEXITCODE -ge 8) { throw "copying quicklisp to $neutralQl failed ($LASTEXITCODE)" }
+  $global:LASTEXITCODE = 0
+}
+New-Item -ItemType Junction -Path (Join-Path $scratchHome 'quicklisp') -Target $neutralQl | Out-Null
 $env:USERPROFILE = $scratchHome
+# SBCL's (user-homedir-pathname) reads HOME first and then the profile folder
+# from the Windows API, never USERPROFILE: without HOME the build loaded the
+# account's own quicklisp and wrote C:/Users/<account>/ into the image.
+$env:HOME = $scratchHome
 $env:HOMEDRIVE = Split-Path -Qualifier $scratchHome
 $env:HOMEPATH = $scratchHome.Substring(2)
 $env:NODECODE_HOME = Join-Path $scratchHome '.nodecode'
@@ -191,6 +206,15 @@ Copy-Item -Recurse (Join-Path $tree 'src\cells') (Join-Path $stage 'src\cells')
 Get-ChildItem (Join-Path $stage 'src\cells') -Recurse -Directory -Filter test | Remove-Item -Recurse -Force
 Copy-Item (Join-Path $tree 'src\nodecode.asd') (Join-Path $stage 'src\nodecode.asd')
 
+# The gate: the build account's home is written nowhere in the program a
+# stranger runs (SBCL keeps every build path in the image).
+$exeText = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes((Join-Path $stage 'nodecode.exe')))
+foreach ($form in @("$accountHome\", (($accountHome -replace '\\', '/') + '/'))) {
+  if ($exeText.IndexOf($form, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+    throw "refusing: the build account's home ($form) is written in nodecode.exe"
+  }
+}
+Remove-Variable exeText
 $zip = Join-Path $Share "$name.zip"
 Remove-Item -Force $zip, "$zip.sha256" -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip

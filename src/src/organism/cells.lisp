@@ -1996,7 +1996,9 @@ an entry of one of the hub's two indexes at a pinned commit."
   ;; it serves (SERVES-ENTRIES), which a consumer may offer it by before it is
   ;; installed: the /models picker, its providers. INDEX is which of the
   ;; hub's indexes listed it, "hub" for Nodecode's own and "community" for
-  ;; the one people submit to; NIL for a shipped folder.
+  ;; the one people submit to; NIL for a shipped folder. ARCHIVE and SHA256
+  ;; are the https URL of a .tar.gz of a PATH entry's folder at its commit
+  ;; and that file's sha256, when its index carries them (HUB-ARCHIVE-CHECKOUT).
   (name "" :type string)
   (directory nil)
   (git nil)
@@ -2007,7 +2009,9 @@ an entry of one of the hub's two indexes at a pinned commit."
   (missing '() :type list)
   (description "" :type string)
   (serves '() :type list)
-  (index nil))
+  (index nil)
+  (archive nil)
+  (sha256 nil))
 
 (access (entry offer) (provider offer))
 
@@ -2229,8 +2233,9 @@ runs, as OFFER records by name, each marked as listed by INDEX."
   ;; Refuses an index that is not format 1 and an entry that breaks it, by
   ;; name: a name that could not be a folder, a URL that is not https://, a
   ;; commit that is not a full id — a branch or a short id is a moving target,
-  ;; and the pin is what a review read — and a path that climbs out of its
-  ;; repository or into a dot folder. An index that lies is refused whole,
+  ;; and the pin is what a review read — a path that climbs out of its
+  ;; repository or into a dot folder, and an archive that is not https:// or
+  ;; comes without its sha256. An index that lies is refused whole,
   ;; never read around.
   (let ((index (decode-json source :whole t))
         (shipped-systems (loop for entry in shipped append entry.systems)))
@@ -2242,6 +2247,8 @@ runs, as OFFER records by name, each marked as listed by INDEX."
            for git = (json-value item :text "git")
            for commit = (json-value item :text "commit")
            for path = (json-value item :text "path")
+           for archive = (json-value item :text "archive")
+           for sha256 = (json-value item :text "sha256")
            for platforms = (json-value item :array "platforms")
            for depends-on = (loop for system across (json-array item "depends_on")
                                   when (stringp system) collect (string-downcase system))
@@ -2264,10 +2271,15 @@ runs, as OFFER records by name, each marked as listed by INDEX."
                 (error "hub entry ~a: commit is a full 40-hex id, not ~s" name commit))
               (unless (or (null path) (ppcre:scan "^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*\\z" path))
                 (error "hub entry ~a: path is a folder inside the repository, a/b, not ~s" name path))
+              (unless (or (and (null archive) (null sha256))
+                          (and archive (uiop:string-prefix-p "https://" archive)
+                               sha256 (ppcre:scan "^[0-9a-f]{64}\\z" sha256)))
+                (error "hub entry ~a: archive is an https:// URL beside its 64-hex sha256" name))
            ;; a name the release ships is the shipped folder's: the hub adds, never replaces
            when (and (or (null platforms) (find +hub-platform+ platforms :test #'equal))
                      (not (find name shipped :key #'offer-name :test #'string=)))
              collect (make-offer :name name :git git :commit commit :path path :index listed-by
+                                 :archive archive :sha256 sha256
                                  :systems (list name)
                                  :depends-on depends-on
                                  :serves serves
@@ -2276,12 +2288,13 @@ runs, as OFFER records by name, each marked as listed by INDEX."
      #'string< :key #'offer-name)))
 
 (defun hub-cells (&key (url *hub-index-url*) (community *community-index-url*)
-                        (shipped (shipped-cells)))
+                        (shipped (shipped-cells)) max-age)
   "The hub's entries this platform runs, as OFFER records by name: Nodecode's
 own (the index at URL), then the community's (at COMMUNITY) less any name
 Nodecode's lists; and as a second value why an index was read from its kept
 copy, or NIL. NIL when both are NIL; a signal naming the reason when no
-index asked for can be read."
+index asked for can be read. With MAX-AGE, an index whose kept copy a read
+wrote under MAX-AGE seconds ago is that copy, unread."
   ;; Each index answers for itself: one that cannot be read leaves the other's
   ;; entries on offer rather than hiding them, and only when every index asked
   ;; for fails is there nothing to offer and a reason to say so.
@@ -2294,21 +2307,25 @@ index asked for can be read."
                (incf asked)
                (let ((kept (home (format nil "hub/~a.json" (short-digest source 16)))))
                  (flet ((offers (text) (read-hub-index text :shipped shipped :index index)))
-                   (handler-case
-                       (bind (((body status _ truncated)
-                               (http :get source :max-bytes (* 1024 1024) :timeout 10)))
-                         (unless (eql status 200)
-                           (error "the hub index at ~a answered ~a" source status))
-                         (when truncated
-                           (error "the hub index at ~a is over a megabyte" source))
-                         (prog1 (offers body)
-                           (write-file-atomically kept body)))
-                     (error (condition)
-                       (if-let (copy (and (probe-file kept)
-                                          (ignore-errors
-                                           (offers (alexandria:read-file-into-byte-vector kept)))))
-                         (progn (push (princ-to-string condition) stale) copy)
-                         (progn (push condition failed) '())))))))))
+                   (or
+                    (and max-age (probe-file kept)
+                         (< (- (get-universal-time) (file-write-date kept)) max-age)
+                         (ignore-errors (offers (alexandria:read-file-into-byte-vector kept))))
+                    (handler-case
+                        (bind (((body status _ truncated)
+                                (http :get source :max-bytes (* 1024 1024) :timeout 10)))
+                          (unless (eql status 200)
+                            (error "the hub index at ~a answered ~a" source status))
+                          (when truncated
+                            (error "the hub index at ~a is over a megabyte" source))
+                          (prog1 (offers body)
+                            (write-file-atomically kept body)))
+                      (error (condition)
+                        (if-let (copy (and (probe-file kept)
+                                           (ignore-errors
+                                            (offers (alexandria:read-file-into-byte-vector kept)))))
+                          (progn (push (princ-to-string condition) stale) copy)
+                          (progn (push condition failed) '()))))))))))
       (let* ((own (entries url "hub"))
              (theirs (remove-if (lambda (entry) (find-offer (offer-name entry) own))
                                 (entries community "community"))))
@@ -2320,17 +2337,128 @@ index asked for can be read."
 (defun repository-links (directory)
   "The symbolic links under DIRECTORY, .git/ passed over, as `find' prints
 them. NIL on Windows, where a clone makes none."
+  ;; Walked in this process (TREE-ENTRIES), `find' only for a tree the walk
+  ;; cannot read: a child cost ~90 ms of a hub install on macOS.
   #+win32 (progn directory nil)
   #-win32
-  (remove "" (lines (run-bounded (list "find" (string-right-trim "/" (uiop:native-namestring directory))
-                                       "-name" ".git" "-prune" "-o" "-type" "l" "-print")
-                                 :seconds 120))
-          :test #'string=))
+  (let ((native (string-right-trim "/" (uiop:native-namestring directory))))
+    (labels ((walk (path)
+               (loop for (child . kind) in (tree-entries path)
+                     unless (string= ".git" (subseq child (1+ (position #\/ child :from-end t))))
+                       if (eq kind :link) collect child
+                       else if (eq kind :directory) append (walk child))))
+      (handler-case (walk native)
+        (error ()
+          (remove "" (lines (run-bounded (list "find" native "-name" ".git" "-prune" "-o" "-type" "l" "-print")
+                                         :seconds 120))
+                  :test #'string=))))))
+
+(defun repository-head (directory)
+  "The commit the repository at DIRECTORY has checked out detached, as its
+.git/HEAD names it; NIL when HEAD names a branch or cannot be read."
+  (let ((line (ignore-errors
+               (string-trim '(#\Newline #\Return #\Space)
+                            (uiop:read-file-string (merge-pathnames ".git/HEAD" directory))))))
+    (and line (ppcre:scan "^[0-9a-f]{40}\\z" line) line)))
+
+;;; --- the copy of a hub repository a home keeps ---------------------------------
+;;; Every folder Nodecode's index lists is a folder of one repository at one
+;;; commit. A clone per install fetched all of it again for each: 0.7 s on a
+;;; near network, 5-25 s on a far one. A home keeps one bare copy per
+;;; repository instead, holding each commit it was asked for one commit deep;
+;;; the first pick at a commit fetches it, and every folder after checks
+;;; out of it with no network.
+
+(defvar *hub-repository-lock* (bt2:make-lock :name "hub repositories")
+  "Held while a copy of a hub repository fetches, so two picks at once
+fetch one commit once.")
+
+(defun hub-git (arguments &optional environment)
+  "Git run with ARGUMENTS, never prompting and never collecting on its own,
+ENVIRONMENT (NAME=value strings) laid over: => its output. Signals its error
+output when it fails."
+  (multiple-value-bind (out err status)
+      (run-bounded (list* *git-program* "-c" "gc.auto=0" arguments) :seconds 600
+                   :environment (list* "GIT_TERMINAL_PROMPT=0" environment))
+    (unless (eql status 0)
+      (error "git ~a failed: ~a" (first arguments) (string-trim '(#\Newline) (or err ""))))
+    out))
+
+(defun hub-repository (entry home)
+  "The copy HOME keeps of hub ENTRY's repository, holding ENTRY's commit:
+made bare and fetched that one commit deep when it lacks it. => its
+directory; signals when git cannot."
+  (let* ((directory (merge-pathnames (format nil "hub/git/~a/" (short-digest (offer-git entry) 16)) home))
+         (native (string-right-trim "/\\" (uiop:native-namestring directory)))
+         (commit (offer-commit entry))
+         (ref (format nil "refs/pins/~a" commit)))
+    (bt2:with-lock-held (*hub-repository-lock*)
+      (unless (or (probe-file (merge-pathnames ref directory))
+                  (let ((packed (merge-pathnames "packed-refs" directory)))
+                    (and (probe-file packed)
+                         (search (format nil "~a ~a" commit ref) (uiop:read-file-string packed)))))
+        (unless (probe-file (merge-pathnames "HEAD" directory))
+          (ensure-directories-exist directory)
+          (hub-git (list "init" "--quiet" "--bare" native)))
+        (hub-git (list "-C" native "fetch" "--quiet" "--depth" "1" "--no-tags" "--" (offer-git entry)
+                       (format nil "+~a:~a" commit ref)))))
+    directory))
+
+;;; A PATH entry's index may name an archive of its folder at its commit, on
+;;; nodecode.ai's /dl beside the index, which Cloudflare keeps at the edge:
+;;; one cell, 8-70 KB, from the nearest edge instead of the repository from
+;;; GitHub. The index pins the archive's sha256 as it pins the commit, so the
+;;; folder unpacked is the pin's as surely as a checkout's.
+
+(defun hub-archive-checkout (entry staging)
+  "Write hub ENTRY's folder, its path at its commit, into STAGING out of the
+archive its index names, when the bytes are the sha256 the index carries:
+=> T, or NIL, with STAGING gone, when there is none or it cannot be had,
+and the caller fetches the repository."
+  (when (and entry.archive entry.sha256)
+    (or (ignore-errors
+         (multiple-value-bind (body status)
+             (http :get entry.archive :binary t :max-bytes (* 16 1024 1024) :timeout 20)
+           (when (and (eql status 200) (typep body '(vector (unsigned-byte 8)))
+                      (string= (sha256-text body) (format nil "sha256:~a" entry.sha256)))
+             (ensure-directories-exist staging)
+             (with-open-file (out (merge-pathnames ".archive.tar.gz" staging) :direction :output
+                                  :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (write-sequence body out))
+             ;; a name relative to the working directory: Git for Windows' tar
+             ;; reads the colon of a drive as a host to fetch the archive from
+             (multiple-value-bind (out err status)
+                 (run-bounded (list "tar" "-xzf" ".archive.tar.gz") :seconds 60 :directory staging)
+               (declare (ignore out))
+               (unless (eql status 0)
+                 (error "~a: tar failed: ~a" entry.name err)))
+             (delete-file (merge-pathnames ".archive.tar.gz" staging))
+             t)))
+        (progn (when (probe-file staging) (remove-tree staging)) nil))))
+
+(defun hub-repository-checkout (entry staging home)
+  "Write hub ENTRY's folder, its path at its commit, into STAGING out of the
+copy HOME keeps of its repository (HUB-REPOSITORY): => T, or NIL when that
+copy cannot give it, and the caller clones."
+  ;; Git writes the pin out of objects named by their own hashes: the folder
+  ;; is the commit's as surely as a clone's HEAD. The index is a throwaway in
+  ;; STAGING, so the copy, which has no work tree, keeps no state of a checkout.
+  (ignore-errors
+   (let ((repository (hub-repository entry home)))
+     (ensure-directories-exist staging)
+     (hub-git (list (format nil "--git-dir=~a" (string-right-trim "/\\" (uiop:native-namestring repository)))
+                    (format nil "--work-tree=~a" (string-right-trim "/\\" (uiop:native-namestring staging)))
+                    "checkout" "--quiet" (offer-commit entry) "--" (offer-path entry))
+              (list (format nil "GIT_INDEX_FILE=~a"
+                            (uiop:native-namestring (merge-pathnames ".git-index" staging)))))
+     t)))
 
 (defun clone-install (entry target)
   "Clone the hub ENTRY at its commit and move it to TARGET, marked the
 installer's. => TARGET."
-  ;; The clone is proven before it moves: HEAD is the pinned commit, the
+  ;; The clone is proven before it moves: HEAD is the pinned commit (a folder
+  ;; checked out of the kept copy is the pin's by its objects' hashes, one
+  ;; unpacked from its index's archive by the archive's sha256), the
   ;; primary system is the entry's name and, for an entry an index listed,
   ;; its description, depends_on and serves are the index's, no symbolic link reaches
   ;; out of it, and every system it declares it needs is here. It is made in
@@ -2341,9 +2469,8 @@ installer's. => TARGET."
   ;; against; one that is a folder of it (its PATH) moves in alone, and the
   ;; rest of the clone goes. A clone runs no hook and fetches no submodule,
   ;; so nothing in it runs before the boot loader loads it.
-  (let* ((staging (merge-pathnames (format nil ".cell-staging/~a/" entry.name)
-                                   (uiop:pathname-parent-directory-pathname
-                                    (uiop:pathname-parent-directory-pathname target))))
+  (let* ((home (uiop:pathname-parent-directory-pathname (uiop:pathname-parent-directory-pathname target)))
+         (staging (merge-pathnames (format nil ".cell-staging/~a/" entry.name) home))
          (native (string-right-trim "/\\" (uiop:native-namestring staging)))
          (source (if entry.path (merge-pathnames (format nil "~a/" entry.path) staging) staging)))
     (flet ((git (verb &rest args)
@@ -2360,10 +2487,17 @@ installer's. => TARGET."
       (with-cleanup ((ignore-errors (when (probe-file staging) (remove-tree staging)))
                      (ignore-errors (uiop:delete-empty-directory
                                      (uiop:pathname-parent-directory-pathname staging))))
-        (git "clone" "--quiet" "--no-checkout" "--" entry.git native)
-        (git "checkout" "--quiet" "--detach" entry.commit)
-        (unless (string= entry.commit (git "rev-parse" "HEAD"))
-          (error "~a: HEAD is not ~a" entry.name entry.commit))
+        ;; A folder of a repository unpacks out of the archive its index names
+        ;; (HUB-ARCHIVE-CHECKOUT), else checks out of the copy this home keeps
+        ;; of it (HUB-REPOSITORY-CHECKOUT); a whole repository, which keeps its
+        ;; .git, and a folder neither can give, clone.
+        (unless (and entry.path (or (hub-archive-checkout entry staging)
+                                    (hub-repository-checkout entry staging home)))
+          (when (probe-file staging) (remove-tree staging))
+          (git "clone" "--quiet" "--no-checkout" "--" entry.git native)
+          (git "checkout" "--quiet" "--detach" entry.commit)
+          (unless (equal entry.commit (repository-head staging))
+            (error "~a: HEAD is not ~a" entry.name entry.commit)))
         ;; a folder the path reaches through a link would move from elsewhere
         (unless (and (probe-file source) (uiop:subpathp (truename source) (truename staging)))
           (error "~a: the repository has no folder ~a" entry.name entry.path))

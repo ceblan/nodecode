@@ -258,6 +258,99 @@ ASK its terminal: (TEXT CODE STREAM PREVIEW), PREVIEW what it printed first."
           (is (search "the hub moved nl-sw-hubbed" (nlk:json-value body :string "error" "message"))))
         (is (not (nlk:installed-cell-p "nodecode-nl-sw-hubbed")))))))
 
+(deftest control-cells-a-pick-at-the-pin-just-read-reads-no-index-again
+    (with-switch-fixture (port base top))
+  ;; The picker read the index a moment ago: turning on its entry at the pin
+  ;; it read takes that read's copy. Another pin reads the hub again, and is
+  ;; refused when the hub pins its own.
+  (let ((reads 0)
+        (commit (make-string 40 :initial-element #\b))
+        (index (hub-index-text (list :name "nl-sw-picked" :git "https://127.0.0.1:9/o/nl-sw-picked.git"
+                                     :commit (make-string 40 :initial-element #\b)
+                                     :path "cells/nl-sw-picked"))))
+    (nle:route "/test-hub/counted.json"
+               (nlk:lambda-ignoring (env)
+                 (incf reads)
+                 (list 200 '(:content-type "application/json") (list index)))
+               :public t)
+    (nlk:with-cleanup ((nle:route "/test-hub/counted.json" nil))
+      (with-saved-globals ((nlk:*hub-index-url* (format nil "http://127.0.0.1:~d/test-hub/counted.json" port))
+                           (nlk:*community-index-url* nil))
+        (nlk:hub-cells :shipped '())
+        (is (= 1 reads) "the picker's read")
+        (with-gateway-http (port :post "/api/gateway/cells" :status 400
+                            :body (format nil "{\"name\": \"nl-sw-picked\", \"on\": true, \"commit\": ~s}" commit))
+          (is (search "git clone failed" (nlk:json-value body :string "error" "message")) "it clones, which fails here"))
+        (is (= 1 reads) "with no second read of the index")
+        (with-gateway-http (port :post "/api/gateway/cells" :status 400
+                            :body (format nil "{\"name\": \"nl-sw-picked\", \"on\": true, \"commit\": ~s}"
+                                          (make-string 40 :initial-element #\c)))
+          (is (search "the hub moved nl-sw-picked" (nlk:json-value body :string "error" "message"))))
+        (is (= 2 reads) "another pin reads the hub again")))))
+
+(deftest control-cells-reading-the-offers-fetches-no-folder
+    (with-switch-fixture (port base top))
+  ;; The offers are read at every launch, for /models: that read downloads
+  ;; no cell, and the first pick of one fetches it. A fetch would make the
+  ;; home's copy before its git failed against the dead port.
+  (with-temp-trees ((home "offers-home"))
+    (nle:route "/test-hub/offered.json"
+               (constantly
+                (list 200 '(:content-type "application/json")
+                      (list (format nil "{\"format\": 1, \"cells\": [{\"name\": \"nl-sw-offered\", \"git\": \"https://127.0.0.1:9/o/cells.git\", \"commit\": ~s, \"path\": \"cells/nl-sw-offered\", \"description\": \"d\", \"serves\": [{\"provider\": \"nl-sw-offered\", \"sign_in\": \"key\"}]}]}"
+                                    (make-string 40 :initial-element #\d)))))
+               :public t)
+    (nlk:with-cleanup ((nle:route "/test-hub/offered.json" nil))
+      (with-saved-globals ((nlk:*hub-index-url* (format nil "http://127.0.0.1:~d/test-hub/offered.json" port))
+                           (nlk:*community-index-url* nil)
+                           (nlk::*cells-directory* (merge-pathnames "cells/" home))
+                           nle::*provider-offers*)
+        (ensure-directories-exist (merge-pathnames "cells/" home))
+        (is (find "nl-sw-offered" (cdr (nle::read-provider-offers)) :key #'nlk:offer-name :test #'string=) "the hub's entry is offered")
+        (dolist (thread (bt2:all-threads))
+          (when (search "hub-warm-up" (bt2:thread-name thread))
+            (bt2:join-thread thread)))
+        (is (null (probe-file (merge-pathnames "hub/" home))) "and nothing was fetched")))))
+
+(deftest control-cells-a-hub-folder-unpacks-from-its-index-archive
+    (with-switch-fixture (port base top))
+  ;; A PATH entry whose index names an archive of its folder installs out of
+  ;; it, off the /dl beside the index, with no git at all: here its git is a
+  ;; dead port. Bytes that are not the index's sha256 are never unpacked, and
+  ;; the install falls back to git, which then fails.
+  (with-temp-trees ((remote "archive-remote") (home "archive-home"))
+    (multiple-value-bind (repository commit)
+        (hub-fixture-repository remote "nl-sw-archived"
+                                (lambda (folder) (write-peripheral-folder (merge-pathnames "cells/" folder) "nl-sw-packed")))
+      (let* ((root (merge-pathnames "cells/" home))
+             (file (merge-pathnames "packed.tar.gz" remote))
+             (dead "https://127.0.0.1:9/o/cells.git")
+             (url (format nil "http://127.0.0.1:~d/test-hub/nl-sw-packed.tar.gz" port)))
+        (nlk::run-checked (list "git" "-C" repository "archive" "--format=tar.gz" "-o" (uiop:native-namestring file)
+                                commit "--" "cells/nl-sw-packed")
+                          (lambda (err) (error "git archive: ~a" err)))
+        (let* ((bytes (with-open-file (in file :element-type '(unsigned-byte 8))
+                        (let ((octets (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                          (read-sequence octets in)
+                          octets)))
+               (sha (subseq (nlk::sha256-text bytes) 7)))
+          (nle:route "/test-hub/nl-sw-packed.tar.gz"
+                     (constantly (list 200 '(:content-type "application/gzip") bytes))
+                     :public t)
+          (nlk:with-cleanup ((nle:route "/test-hub/nl-sw-packed.tar.gz" nil))
+            (flet ((entry (sha256)
+                     (hub-offer "nl-sw-packed" dead commit :path "cells/nl-sw-packed" :archive url :sha256 sha256)))
+              (is (hub-install (entry sha) root) "the archive installs with no git")
+              (let ((folder (merge-pathnames "nl-sw-packed/" root)))
+                (is (probe-file (merge-pathnames "nl-sw-packed.asd" folder)))
+                (is (null (probe-file (merge-pathnames ".archive.tar.gz" folder))) "the archive itself goes")
+                (is (equal (list dead commit "cells/nl-sw-packed") (uiop:read-file-lines (merge-pathnames ".hub" folder)))))
+              (is (null (probe-file (merge-pathnames "hub/" home))) "and no repository was fetched")
+              (is (nlk:uninstall-cell "nl-sw-packed" :root root))
+              (is (search "git clone failed" (hub-refusal (entry (reverse sha)) root)) "other bytes are refused")
+              (is (not (nlk:installed-cell-p "nl-sw-packed" root)))
+              (is (null (probe-file (merge-pathnames ".cell-staging/" home))) "and leave nothing staged"))))))))
+
 (deftest control-cells-hub-reads-both-indexes-and-each-answers-for-itself
     (with-switch-fixture (port base top))
   ;; Nodecode's own index and the community's are read side by side: a name

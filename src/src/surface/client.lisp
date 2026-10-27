@@ -697,6 +697,19 @@ so a streamed item and its durable fact are one row, never two."
                  (when-let (row (find-band-row st nil shell-id))
                    (note-band-preview row preview)))))))
         st)
+       ((string= kind "session_fork_progress")
+        ;; Live-only: how the forks of a running call stand (fork.lisp
+        ;; FORK-COLLECT-PROGRESS), set on the call's own rows as their
+        ;; "forks" -- a fresh metadata object, so each row's memo sees the
+        ;; change. Never replayed: each fork's session is the record.
+        (let ((call-id (json-value payload :string "tool_call_id"))
+              (forks (json-value payload :array "forks")))
+          (when (and call-id forks)
+            (dolist (row (transcript-rows st))
+              (when (and (eq :tool-call row.kind) (equal call-id row.tool-call-id))
+                (setf row.metadata (copy-json-object (and (hash-table-p row.metadata) row.metadata)
+                                                     "forks" forks))))))
+        st)
        ((string= kind "session_input_queue_snapshot_updated")
         ;; Queue state, and the band's one authority. A steer parks here,
         ;; with no fact of its own until promotion starts it as the next
@@ -2713,7 +2726,7 @@ gateway."
   "Answer the connect challenge FRAME on WS as this nodecode's MODE client
 INSTANCE, TOKEN its operator token."
   (wsd:send ws (encode-gateway-connect (gethash "challenge_nonce" (nlk:sync-message-payload frame))
-                                       "nodecode" "0.0.1" mode (string-downcase (nlk:platform))
+                                       "nodecode" *user-agent-version* mode (string-downcase (nlk:platform))
                                        instance :operator-token token)))
 
 (defun run-chat-gateway (&key session-id port
@@ -3318,6 +3331,10 @@ models -- so a shell never builds the list itself.")
           :connected (ids "connected")
           :listable (ids "listable")
           :local (ids "local")
+          ;; (ID . NAME) for each provider its folder names (OFFERED-PROVIDER-NAME)
+          :names (loop for provider across (or (gethash "providers" body) #())
+                       for name = (gethash "name" provider)
+                       when (stringp name) collect (cons (gethash "id" provider) name))
           ;; (ID . WHY) for each provider no turn can run on there, WHY the
           ;; gateway's words (PROVIDER-TURN-REFUSAL reads them).
           :refusals (loop for provider across (or (gethash "providers" body) #())
@@ -3396,6 +3413,12 @@ run -- builds them from MODEL-CHOICES; a shell reads them from it
 (defun picker-provider-offers ()
   "PROVIDER-OFFERS as the serving image answers it."
   (if *serving* (ignore-errors (provider-offers)) (getf *gateway-models* :offers)))
+
+(defun picker-provider-name (id)
+  "OFFERED-PROVIDER-NAME as the serving image answers it."
+  (if *serving*
+      (ignore-errors (offered-provider-name id))
+      (cdr (assoc id (getf *gateway-models* :names) :test #'string-equal))))
 
 (defun install-offered-cell (model offer)
   "Install OFFER's folder (PROVIDER-OFFERS) through MODEL's organism at the
@@ -4516,6 +4539,11 @@ caveats a setup walk ended on (SETUP-ISSUE-SEGS) lead each and are shed last."
           (setf candidates (append (loop for candidate in candidates
                                          collect (append meter (list separator) candidate))
                                    (last candidates))))
+        ;; The connection knob (connection.lisp) leads the meter and is the last thing shed.
+        (when-let (knob (connection-knob-segs model))
+          (setf candidates (append (loop for candidate in candidates
+                                         collect (append knob (list separator) candidate))
+                                   (list knob))))
         (if issues
             (append (mapcar (lambda (candidate) (append issues (list separator) candidate)) candidates)
                     (list issues))
@@ -4618,6 +4646,8 @@ footer."
       ;; attach whose facts land after the first frame is the case this path
       ;; exists to measure (NODECODE_PHASE_LOG).
       (nlk:note-boot-phase "model-facts" (getf facts :model))
+      ;; A model chosen is measured once, before anyone prompts it (connection.lisp).
+      (check-connection model)
       (render-state model))))
 
 (defparameter *first-frame-facts-settle-ms* 25
@@ -4984,7 +5014,10 @@ the list on both shells)."
       (dolist (id (union connected listable :test #'string-equal))
         (unless (find id rows :test #'string-equal :key #'provider)
           (let ((state (if (configured-provider-lane id) (provider-auth-state id) :none)))
-            (row id (or (json-value (configured-provider-entry id) :text "display_name") id) state
+            (row id (or (json-value (configured-provider-entry id) :text "display_name")
+                        (picker-provider-name id)
+                        id)
+                 state
                  (format nil "~d model~:p  ~a" (models id)
                          (or (key-check-state id)
                              (if (eq state :none) "configured" "connected")))))))
@@ -4994,7 +5027,7 @@ the list on both shells)."
       ;; alone reached a lane that cannot talk to it (OpenCode Go answers 400
       ;; MissingSessionID) -- and one models.dev lacks (ChatGPT's Codex) is
       ;; listed by the name its folder gives it. The row says nothing of the
-      ;; install: picking it is the whole of it (peasantry1833: "Less is more").
+      ;; install: picking it is the whole of it ("less is more").
       (dolist (offer (picker-provider-offers))
         (let* ((id (getf offer :provider))
                (held (find-if (lambda (row)
@@ -9650,13 +9683,21 @@ quietly."
     (format t "~&[CP-ISSUE-20260912-001] gateway ready~%")
     (let ((heartbeat-noted nil))
       (loop
+        ;; A candidate that loses did not die: the receipt BOOT-CELLS left
+        ;; before its load goes with it, or the launch after reads a self that
+        ;; died before serving and runs pristine -- no cell, so no cell's
+        ;; command. Most visible on Windows, where every serve loads directly
+        ;; and so leaves one.
         (if wait
             (await-free-store path :tick #'nlk:systemd-watchdog)
-            (when (nlk::store-lease-held-p path) (return :lost)))
+            (when (nlk::store-lease-held-p path)
+              (nlk:take-self-receipt)
+              (return :lost)))
         (with-handlers ((nlk::store-in-use (refusal)
                           (format t "~&election lost: ~a~%" refusal)
                           (finish-output)
                           (unless wait
+                            (nlk:take-self-receipt)
                             (return :lost))))
           ;; The models.dev catalog is parsed beside the boot, not by its
           ;; first reader: the first turn's model, /models and the setup
