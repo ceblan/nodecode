@@ -218,6 +218,8 @@ a probe beside a measurement, one check over three folders -- or one probe
 whose output would bury this context. When not to: a plain linear task, one
 read, steps that each need the step before; do those here. Forks run at once
 in the same folder, so give each a task that touches nothing another one does.
+A task's first line names its fork -- in /sessions, and under the call in the
+shell while the forks run -- so open each with a few words saying which it is.
 A fork cannot fork, and its answer comes back here, never to a person. A fork
 pays for its own work, not this context again: it starts from this session's
 cached prefix. A wait past the eval's yield goes on in the background, and its
@@ -2656,6 +2658,11 @@ separate turn.usage fact owns here. The round index rides *PROVIDER-ROUND*."
                            ;; scratch, never as another model's continuation.
                            (seal-streamed-attempt (provider-error-detail e) "rerun")
                            (setf sealed-reasoning "" sealed-text "")
+                           ;; The candidate's attempt is timed from its own
+                           ;; request: a cadence carried over kept the
+                           ;; refused attempt's first token, and the
+                           ;; candidate's TTFT came out negative.
+                           (void-partial-stream)
                            (when *current-durable-turn*
                              (nlk:record-provider-fallback
                               *current-durable-turn*

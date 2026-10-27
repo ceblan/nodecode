@@ -49,7 +49,7 @@ of stacking."
 (defsystem "nodecode"
   :description "A self-modifying agent organism in SBCL: gateway, session, turn loop, and heredity."
   :license "MIT"
-  :version "0.0.1"
+  :version "0.1.1"
   ;; Dependency amendment seam.
   ;; A1 added: shasht (JSON codec) and two SBCL contribs.
   ;;
@@ -346,6 +346,8 @@ of stacking."
      (:file "surface/status")
      ;; account login is a CLI child over the HTTP account-link contract and canonical config/key writers.
      (:file "surface/account-login")
+     ;; connection: the footer's knob, one measured handshake a model pick and the provider terms.
+     (:file "surface/connection")
      ;; backup: this home kept whole and brought back as a profile -- the
      ;; store read through health's reader, the archive profile.lisp's shape.
      (:file "surface/backup")
@@ -464,6 +466,7 @@ of stacking."
      ;; fixture to the keeper's gates below.
      (:file "organism/generation-test")
      (:file "organism/fork-test")
+     (:file "organism/fork-progress-test")
      ;; launch-keeper-test follows warm-test: it drives the same warm fixtures
      ;; for the keeper and the layer cache's own pruning.
      (:file "organism/launch-keeper-test")
@@ -512,6 +515,7 @@ of stacking."
      (:file "tui/editor-test")
      (:file "tui/ui-test")
      (:file "tui/activity-label-spacing-test")
+     (:file "tui/fork-tree-test")
      (:file "tui/inline-color-test")
      (:file "tui/frame-clock-test")
      (:file "tui/history-test")
@@ -527,6 +531,7 @@ of stacking."
      (:file "tui/indentation-test")
      (:file "tui/launch-test")
      (:file "surface/account-login-test")
+     (:file "surface/connection-test")
      (:file "tui/scroll-test")
      (:file "tui/chrome-test")
      (:file "tui/home-sessions-test")
@@ -558,6 +563,7 @@ of stacking."
      ;; `nodecode rpc' to a gateway and its frames back.
      (:file "surface/rpc-test")
      (:file "surface/observe-test")
+     (:file "surface/usage-projection-test")
      ;; sessions-nodes-test drives the same picker rows: a session's own
      ;; nodes under it, the edge each hangs by, and the store's detached
      ;; create that a team seat is minted with.

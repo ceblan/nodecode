@@ -1689,7 +1689,12 @@ no prompt queued."
       (record-background-shell-exit-from-update update)
       ;; The watcher edge of the exit wake: an idle session wakes now.
       (when wake
-        (ignore-errors (wake-idle-session update.session-id))))))
+        (ignore-errors (wake-idle-session update.session-id)))))
+  ;; How a running call's forks stand (fork.lisp FORK-COLLECT-PROGRESS):
+  ;; live-only frames, as the band's are; each fork's session is the record.
+  (dolist (frame (ignore-errors (nlk:fork-collect-progress)))
+    (ignore-errors
+     (publish-event (first frame) "session_fork_progress" (second frame)))))
 
 (defun start-background-exec-watcher ()
   (unless *background-exec-watcher*
@@ -1739,19 +1744,25 @@ no prompt queued."
   ;; A body of one (:admit ACTION SUBMIT-ARG...) clause is the turn-admission
   ;; shell: PROMPT and IMAGES submitted on SID under a websocket invocation
   ;; named ACTION, with SUBMIT-ARGS riding to SUBMIT, and the admission
-  ;; relayed through RESULT.
+  ;; relayed through RESULT. A (:target PROVIDER MODEL EFFORT) clause before
+  ;; it pins SID to that target first (CALL-ADMISSION).
   ;;
   ;; The shared entry contract — decode, scope check, protocol-error mapping —
   ;; stays in DISPATCH-COMMAND; a declaration here owns only its own command.
-  (let ((clauses (loop while (and (consp (first body))
-                                  (member (first (first body)) '(:require :subscribed)))
-                       collect (pop body))))
+  (let* ((clauses (loop while (and (consp (first body))
+                                   (member (first (first body)) '(:require :subscribed)))
+                        collect (pop body)))
+         (target (when (and (consp (first body)) (eq (first (first body)) :target))
+                   (rest (pop body)))))
     (when (and (consp (first body)) (eq (first (first body)) :admit))
       (destructuring-bind (action &rest submit-args) (rest (first body))
         (setf body
               ;; A shell: admission semantics live in SUBMIT, only its wire mapping here.
               `((apply
                  #'result
+                 (call-admission
+                  sid ,(and target `(list ,@target))
+                  (lambda ()
                  (with-handlers ((turn-worker-unavailable ()
                                    (list "rejected" "worker_unavailable"
                                          "no turn worker became available; turn failed durably"))
@@ -1781,7 +1792,7 @@ no prompt queued."
                               admission.queue-depth admission.prompt-id admission.sequence))
                        (:steered
                         (list "accepted" "ok" "turn steered" admission.turn-id 0
-                              admission.prompt-id admission.sequence))))))))))
+                              admission.prompt-id admission.sequence))))))))))))
     `(setf (gethash ,kind *sync-command-handlers*)
            (lambda-ignoring (peer payload command-id correlation-id subscription-list)
              (with-json ((sid :string "session_id") ,@payload-specs) payload
@@ -1801,13 +1812,99 @@ no prompt queued."
                                         (result "rejected" "not_subscribed" ,head ,@rest)))))
                    (t ,@body))))))))
 
+(defvar *start-turn-pin-lock* (bt2:make-lock :name "start_turn target pin")
+  "Serializes PIN-START-TURN-TARGET's read and write, so two start_turns
+racing on one session not yet begun cannot both find it unpinned.")
+
+(defun pin-start-turn-target (session-id provider model effort)
+  "Pin SESSION-ID to the target a start_turn's PROVIDER, MODEL and EFFORT
+members name, before its turn is admitted: SELECT-SESSION-MODEL's pin
+without its default half, so the shared config, this image's default and
+every other session stay as they are. => (values REFUSAL UNDO): REFUSAL a
+(CODE MESSAGE) list when the members are refused, nothing written; UNDO a
+thunk that puts back the selection the pin replaced, NIL when nothing was
+written."
+  ;; Only a session not yet begun takes a target: its first turn pins what it
+  ;; runs (RUN), and a switch mid-conversation would re-send the whole
+  ;; prompt uncached. A begun session takes members naming its own target --
+  ;; a reconnecting client resends its start_turn as it was -- and refuses
+  ;; any other. A model alone keeps the lane the session would run on, as a
+  ;; /models pick does. Written before admission, because the first turn's
+  ;; RUN pins the default on a session it finds unpinned; under the lock,
+  ;; because the read and the write are two store calls. A session this
+  ;; image does not know is SUBMIT's to refuse, by name.
+  (check-type session-id string)
+  (unless (and (nlk:store-open-p)
+               (handler-case (nlk:session-exists-p session-id) (type-error () nil)))
+    (return-from pin-start-turn-target (values nil nil)))
+  (bt2:with-lock-held (*start-turn-pin-lock*)
+    (bind (((pinned-provider pinned-model) (nlk:session-model-selection session-id))
+           (picked-effort (nlk:session-model-effort session-id))
+           (target-provider (or provider pinned-provider *provider*))
+           (target-model (or model pinned-model *model*)))
+      (when (and pinned-provider pinned-model)
+        (return-from pin-start-turn-target
+          (if (and (equal target-provider pinned-provider) (equal target-model pinned-model)
+                   (or (null effort) (equal effort picked-effort)))
+              (values nil nil)
+              (values (list "session_pinned"
+                            (format nil "session ~a runs on ~a/~a~@[ at effort ~a~]: ~
+                                         a session keeps the target it began on"
+                                    session-id pinned-provider pinned-model picked-effort))
+                      nil))))
+      (handler-case
+          (progn
+            (check-model-id target-provider target-model)
+            ;; SELECT-DEFAULT-MODEL's resolve half: the lane, and the address
+            ;; it rides unless the process override already is one.
+            (if (and *endpoint* (equal target-provider *provider*))
+                (find-provider-lane target-provider)
+                (provider-endpoint target-provider))
+            (check-effort target-provider target-model effort))
+        (provider-error (condition)
+          (return-from pin-start-turn-target
+            (values (list "unknown_provider" (provider-error-detail condition)) nil)))
+        (effort-refusal (condition)
+          (return-from pin-start-turn-target
+            (values (list "effort_unsupported" (effort-refusal-detail condition)) nil))))
+      (nlk:record-session-model-selection
+       session-id :provider target-provider :model target-model
+       :effort (or effort (admitted-effort picked-effort target-provider target-model)))
+      (broadcast-model-changed session-id)
+      (values nil
+              (lambda ()
+                (nlk:record-session-model-selection
+                 session-id :provider pinned-provider :model pinned-model :effort picked-effort)
+                (broadcast-model-changed session-id))))))
+
+(defun call-admission (session-id target admit)
+  "ADMIT's (STATUS CODE MESSAGE ...) answer for SESSION-ID, once TARGET -- a
+start_turn's (PROVIDER MODEL EFFORT), NIL or all NIL when it names none --
+has pinned the session (PIN-START-TURN-TARGET): a refused target is the
+answer and nothing is admitted, and an admission refused after the pin puts
+the session's selection back."
+  (multiple-value-bind (refusal undo)
+      (and (some #'identity target) (apply #'pin-start-turn-target session-id target))
+    (if refusal
+        (list* "rejected" refusal)
+        (let ((outcome (funcall admit)))
+          (when (and undo (equal "rejected" (first outcome)))
+            (funcall undo))
+          outcome))))
+
 (define-sync-command :start-turn ((prompt :text "prompt")
                                   ;; :any — the codec normalizes wire content
                                   ;; to a Lisp list of staged attachments, not
                                   ;; a JSON array.
-                                  (images :any "images"))
+                                  (images :any "images")
+                                  ;; The target a session not yet begun runs
+                                  ;; on, all optional (PIN-START-TURN-TARGET).
+                                  (provider :text "provider")
+                                  (model :text "model")
+                                  (effort :text "effort"))
   (:require (and sid prompt) "session_id and non-empty prompt are required")
   (:subscribed "subscribe to the session before starting a turn")
+  (:target provider model effort)
   (:admit "turn.start"))
 
 (define-sync-command :steer-turn ((prompt :text "prompt")
@@ -2044,6 +2141,9 @@ position (the cursor a resume names), the target its next turn binds
                     (send-frame-under-lock
                      gws peer "session_background_process_updated"
                      (background-process-update-payload update)))
+                  ;; A call's forks still running, as their last frame said.
+                  (dolist (progress (ignore-errors (nlk:fork-progress-snapshots sid)))
+                    (send-frame-under-lock gws peer "session_fork_progress" progress))
                   ;; The queue is live-only too: a steer parked on the running
                   ;; turn reaches this peer as the queue's frame, not the replay,
                   ;; and so does the end of a follow-up the replay folded as
@@ -2634,7 +2734,9 @@ reads, since a cell's lanes and inventory hooks run here only."
                                                 ;; Whether a turn can run on it here, and why not
                                                 ;; in the words that say what to do.
                                                 "ready" (not refusal)
-                                                :opt "refusal" refusal))
+                                                :opt "refusal" refusal
+                                                ;; what its folder calls it (OFFERED-PROVIDER-NAME)
+                                                :opt "name" (ignore-errors (offered-provider-name id))))
                                  'vector)
                          "offers" (map 'vector
                                        (lambda (offer)
