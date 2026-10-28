@@ -17,7 +17,9 @@
 ;;;;     so concurrent sessions never contend on index.lock
 ;;;;   - every captured tree is anchored on the chained ref
 ;;;;     refs/nodecode/checkpoints; an unanchored write-tree is gc bait
-;;;;   - gc.auto stays 0; REPACK-STORE is the only compactor and never prunes
+;;;;   - gc.auto stays 0; REPACK-STORE is the only compactor, and it prunes
+;;;;     only what a cruft pack has held past CRUFT-EXPIRATION (never a young
+;;;;     object some in-flight capture has written but not yet anchored)
 ;;;;   - restore is strictly per-path and hash-guarded: a path whose on-disk
 ;;;;     content differs from the session's last recorded write is a
 ;;;;     :foreign-write conflict, reported and left alone (never clobbered)
@@ -195,7 +197,14 @@ SAVE-LISP-AND-DIE or fork."
   (with-output-file (stream (snapshot-store-file store "info/exclude"))
     ;; An undo must never roll back the event log that recorded it — hence
     ;; the sqlite patterns (Zig parity) and the organism's own state dir.
+    ;; Rebuildable weight stays out too: dependency trees and caches are
+    ;; git add -A bait no undo ever wants back. One workspace's 137MB vector
+    ;; db once cost 112MB of store as a loose blob and its packed twin, so
+    ;; every db spelling is covered, not just .sqlite.
     (dolist (line (list "*.sqlite" "*.sqlite-wal" "*.sqlite-shm" "*.sqlite-journal"
+                        "*.sqlite3" "*.sqlite3-wal" "*.sqlite3-shm" "*.sqlite3-journal"
+                        "*.db" "*.db-wal" "*.db-shm" "*.db-journal"
+                        ".cache/" "node_modules/"
                         "/.nodecode/"))
       (write-line line stream))
     ;; The live sqlite store when its path resolves under the workspace (a
@@ -890,15 +899,21 @@ handler AFTER the head move commits and outside any store transaction."
 
 ;;; --- retention / repack lane ---------------------------------------------
 
-(defun repack-store (store)
-  "Collapse loose objects into packfile delta chains."
+(defun repack-store (store &key (cruft-expiration "1.day.ago"))
+  "Collapse loose objects into packfile delta chains, expiring dead history."
   ;; -a -d deletes only
-  ;; loose objects that just became packed, never unreachable ones — this lane
-  ;; never prunes. => T, or NIL on any failure (logged, never signalled).
+  ;; loose objects that just became packed. Unreachable objects — a dropped
+  ;; checkpoint, a blob no ref reaches any more — go to a cruft pack and are
+  ;; dropped once older than CRUFT-EXPIRATION: a horizon long enough that an
+  ;; in-flight capture's seconds-old objects are never touched, short enough
+  ;; that a workspace's dead blobs stop accumulating for ever.
+  ;; => T, or NIL on any failure (logged, never signalled).
   (with-handlers ((error (condition)
                     (warn "snapshot repack skipped: ~a" condition)
                     nil))
-    (run-snapshot-git store (list "repack" "-a" "-d" "-q")) t))
+    (run-snapshot-git store (list "repack" "-a" "-d" "-q" "--cruft"
+                                  (format nil "--cruft-expiration=~a" cruft-expiration)))
+    t))
 
 (defun acquire-repack-lock (store)
   "Exclusive-create the repack lockfile; break it past the stale horizon so

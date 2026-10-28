@@ -252,7 +252,14 @@ completed once BODY is done."
 
 (deftest snapshot-excludes-own-store-and-sqlite-patterns (with-git-workspace (store dir))
   (%write-file dir "real.txt" "content" "state.sqlite" "not captured"
-               "state.sqlite-wal" "not captured" ".nodecode/state" "not captured")
+               "state.sqlite-wal" "not captured" ".nodecode/state" "not captured"
+               "app.db" "not captured")
+  ;; The store was once 129M of one workspace's .cache and its deps; these
+  ;; are the paths that made it, and a capture must never ship them.
+  (ensure-directories-exist (merge-pathnames ".cache/" dir))
+  (ensure-directories-exist (merge-pathnames "node_modules/pkg/" dir))
+  (%write-file dir ".cache/vectors.db" "not captured"
+               "node_modules/pkg/index.js" "not captured")
   (is (not (nlk::path-within-p (nlk:snapshot-store-git-dir store)
                                (string-right-trim "/" (namestring dir)))) "the store lives outside the work tree it captures")
   (let ((sha (nlk:capture-workspace-tree store)))
@@ -260,6 +267,9 @@ completed once BODY is done."
     (is-table (path) (null (nlk:hash-in-tree store sha path))
       ("state.sqlite" "sqlite file excluded")
       ("state.sqlite-wal" "sqlite sidecar excluded")
+      ("app.db" "a db file excluded")
+      (".cache/vectors.db" "a cache directory excluded")
+      ("node_modules/pkg/index.js" "a dependency tree excluded")
       (".nodecode/state" "a workspace's own .nodecode/ excluded"))))
 
 (deftest a-work-tree-cannot-ship-the-snapshot-store ()
@@ -338,6 +348,35 @@ completed once BODY is done."
         (is (null (nth-value 1 (nlk:restore-paths store oldest changes
                                                   (%claims-at store head changes)))))))
     (is (equal "version one" (%read-file dir "file.txt")))))
+
+(defun %object-present-p (store sha)
+  "Does STORE's object database still hold SHA, loose or packed or cruft?"
+  (handler-case (progn (nlk::run-snapshot-git store (list "cat-file" "-e" sha)) t)
+    (condition () nil)))
+
+(deftest snapshot-repack-expires-dead-history (with-git-workspace (store dir))
+  ;; SN8, the other half: an unreachable object rides the cruft pack while it
+  ;; is younger than the horizon and is gone once the horizon has passed.
+  ;; Dead history is bounded, not eternal — a 129M store was made of it.
+  ;; An anchored tree keeps the store a real repo — repack has something to
+  ;; pack around, which is the state a working store is always in.
+  (%write-file dir "live.txt" "a tree a checkpoint anchors")
+  (let ((live (%anchored-capture store "live")))
+    (%write-file dir "dead.txt" "a tree nothing anchors")
+    (let ((dead (nlk:capture-workspace-tree store)))
+      ;; A later capture drops dead.txt from the session's index, and the
+      ;; index is what kept the tree alive: repack counts what the index
+      ;; stages, so a tree the session still has staged is never cruft.
+      (delete-file (merge-pathnames "dead.txt" dir))
+      (nlk:capture-workspace-tree store)
+      (is (%object-present-p store dead) "dead exists before any repack")
+      (is (nlk:repack-store store :cruft-expiration "1.day.ago") "repack inside the horizon")
+      (is (%object-present-p store dead) "young cruft rides the cruft pack")
+      (let* ((unix (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
+             (ahead (format nil "@~a" (+ 3600 unix))))
+        (is (nlk:repack-store store :cruft-expiration ahead) "repack past the horizon")
+        (is (not (%object-present-p store dead)) "past the horizon the dead tree is gone")
+        (is (%object-present-p store live) "the anchored tree survives the expiry")))))
 
 (deftest snapshot-repack-lock-contention-skips (with-git-workspace (store dir))
   (let ((lock-path (%store-file store "repack.lock")))
