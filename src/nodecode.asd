@@ -517,6 +517,8 @@ specific than SYSTEM at the image-op seam below."))
      ;; context-test follows turn-test: it drives the same store fixtures and
      ;; seed helpers.
      (:file "engine/context-test")
+     ;; tool-call-id-test follows turn-test: it drives turn-test's canned SSE helpers.
+     (:file "engine/tool-call-id-test")
      (:file "engine/working-context-proof")
      (:file "engine/working-context-test")
      ;; activity-test follows turn-test: its receipt proof drives the same
