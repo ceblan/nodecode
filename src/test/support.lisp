@@ -75,6 +75,11 @@ operator file."
         ;; composes a frame asserts the display authority's contract (every
         ;; row exactly the terminal width, no ESC the shell did not write).
         (nodecode.evolved::*frame-guard-strict* t)
+        ;; The composer catalog cache is machine state: the boot installs
+        ;; what the last real walk on this host answered for this workspace,
+        ;; and every gate that expects an unloaded catalog reads it. NIL
+        ;; disables it; the test that covers the cache binds its own path.
+        (nodecode.evolved::*composer-catalog-cache-path* nil)
         ;; Composer prompt history is machine state, same as the catalog
         ;; cache: NIL disables persistence; tests that cover it bind their
         ;; own temp path.
