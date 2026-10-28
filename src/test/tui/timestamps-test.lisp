@@ -373,3 +373,34 @@ where an Eval or a Think label stands."
       (assert (equal (color-sgr (visual-style-bg (style-for-tone :user-block)) nil :truecolor)
                      (nlt:cell-bg (nlt::screen-buffer-ref buffer 8 4))))
       (assert (null (nlt:cell-bg (nlt::screen-buffer-ref buffer 8 5)))))))
+(nodecode.test:deftest nodecode.test::two-folds-share-one-clock-table ()
+  "The clock table two folds write takes its own lock: a page with two sessions subscribed."
+  ;; A browser page with two sessions subscribed folds two replays at once,
+  ;; each on the peer writer that hands it to its client, and a live frame
+  ;; folds beside a replay. Unsynchronized, SBCL answers `Unsafe concurrent
+  ;; operations' from inside the fold; the exception kills that writer, the
+  ;; view never reaches its replay's last chunk, and the session reads empty
+  ;; for good -- one more session that will not load on every reload.
+  (assert (sb-ext:hash-table-synchronized-p *transcript-time-facts*))
+  (let* ((start (bt2:make-semaphore))
+         (failures '())
+         (report (bt2:make-lock :name "clock-fold-failures"))
+         (folds (loop for n below 4
+                      collect
+                      (bt2:make-thread
+                       (lambda ()
+                         (bt2:wait-on-semaphore start)
+                         (handler-case
+                             (loop for i below 400
+                                   do (note-transcript-time (+ 1000000000 i) 4000000000000
+                                                            "turn.started"
+                                                            (format nil "clock-race-~d-~d" n i)))
+                           (error (e) (bt2:with-lock-held (report) (push e failures)))))
+                       :name "clock-fold-probe"))))
+    (loop repeat (length folds) do (bt2:signal-semaphore start))
+    (mapc #'bt2:join-thread folds)
+    (loop for n below 4
+          do (loop for i below 400
+                   do (remhash (+ 1000000000 i) *transcript-time-facts*)
+                      (remhash (format nil "clock-race-~d-~d" n i) *transcript-time-facts*)))
+    (assert (null failures) () "no fold loses the clock table: ~s" failures)))

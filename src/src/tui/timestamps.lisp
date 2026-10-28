@@ -6,7 +6,16 @@
 (in-package #:nodecode.evolved)
 
 
-(defvar *transcript-time-facts* (make-hash-table :test 'equal) "Persisted-history event clocks: log position -> universal-time-ms; turn id -> timing plist.")
+(defvar *transcript-time-facts* (make-hash-table :test 'equal :synchronized t)
+  "Persisted-history event clocks: log position -> universal-time-ms; turn id -> timing plist.
+The one table two folds share. Each rows view folds its own replay on the
+peer writer that hands it over (rows.lisp ROWS-VIEW-RECEIVE), so a page with
+two sessions subscribed folds on two threads at once, and a live frame folds
+beside a replay. An unsynchronized table answers SBCL's `Unsafe concurrent
+operations' in the middle of the fold; the exception kills the writer, the
+view never reaches its replay's last chunk, and that session reads empty in
+the browser until the page is reloaded -- and empties itself again the next
+time two folds meet.")
 
 (defvar *transcript-live-times* (make-hash-table :test 'eq :weakness :key) "Live-only first-paint clocks for rows without durable event ownership.")
 
