@@ -1070,4 +1070,11 @@ cache — then dump this process as PATH, an executable image whose
                 :entry-point (uiop:ensure-function
                               'nodecode.evolved::main)))
    :executable t
+   ;; A dumped image is mostly untouched dynamic space -- 93% of this one was
+   ;; zeroes -- and SBCL writes it whole. Compressed it is a fraction of the
+   ;; file, at the cost of a startup that expands it again: measured on the
+   ;; 2.6.4 runtime, 729M became ~21M for about half a second. The feature is
+   ;; the build's, not ours: a runtime without it dumps as it always did.
+   #+sb-core-compression :compression
+   #+sb-core-compression 9
    :save-runtime-options t))

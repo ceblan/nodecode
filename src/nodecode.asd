@@ -381,7 +381,23 @@ of stacking."
   (setf (asdf:component-version system)
         (nodecode-version (asdf:component-version system))))
 
+(defclass nodecode-bin-system (asdf:system) ()
+  (:documentation "The executable's system class, which exists only to be more
+specific than SYSTEM at the image-op seam below."))
+
+;; ASDF's own image-op performer is `(dump-image (output-file o c) :executable ...)',
+;; and DUMP-IMAGE takes the compression as an argument that call never supplies: so
+;; the core dumps whole, and a dumped dynamic space is mostly untouched zeroes.
+;; This is the same call with the one argument that matters. A runtime built
+;; without zstd simply has no such feature, and dumps exactly as it did before.
+(defmethod asdf:perform ((o asdf:image-op) (c nodecode-bin-system))
+  (uiop:dump-image (asdf:output-file o c)
+                   :executable (typep o 'asdf:program-op)
+                   #+sb-core-compression :compression
+                   #+sb-core-compression 9))
+
 (defsystem "nodecode/bin"
+  :class nodecode-bin-system
   :description "Standalone executable: the organism dumped with SAVE-LISP-AND-DIE."
   :license "MIT"
   ;; The released image is the only Lisp available on a target machine: a
