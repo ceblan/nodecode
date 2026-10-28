@@ -61,7 +61,6 @@ compose_file="$(publish_setting NODECODE_PUBLISH_COMPOSE_FILE)" || exit 1
 env_file="$(publish_setting NODECODE_PUBLISH_ENV_FILE)" || exit 1
 base_url="${NODECODE_PUBLISH_BASE_URL:-https://nodecode.ai}"
 base_url="${base_url%/}"
-marketplace="$(publish_setting NODECODE_PUBLISH_MARKETPLACE_DIR)" || exit 1
 
 # Every release is a version on GitHub's releases page: the base that
 # src/nodecode.asd declares at the commit, tagged v<base> at that commit, with
@@ -90,10 +89,16 @@ authority_installer="${NODECODE_PUBLISH_INSTALLER_PATH:-$repo/src/tools/install.
 authority_ps1="${NODECODE_PUBLISH_PS1_PATH:-$repo/src/tools/install.ps1}"
 # The site builds its image from this branch of the repository the local
 # clone tracks; the installers are mirrored there, never into the clone.
-site_remote="$(git -C "$marketplace" remote get-url origin 2>/dev/null)" || {
-  echo "publish: $marketplace has no origin to push the installers to" >&2
-  exit 1
-}
+# NODECODE_PUBLISH_SITE_REMOTE names that repository directly, for a publisher
+# with no clone of the site (the Release workflow); else the clone's origin.
+site_remote="$(publish_setting NODECODE_PUBLISH_SITE_REMOTE 2> /dev/null)" || site_remote=''
+if [ -z "$site_remote" ]; then
+  marketplace="$(publish_setting NODECODE_PUBLISH_MARKETPLACE_DIR)" || exit 1
+  site_remote="$(git -C "$marketplace" remote get-url origin 2>/dev/null)" || {
+    echo "publish: $marketplace has no origin to push the installers to" >&2
+    exit 1
+  }
+fi
 site_branch="${NODECODE_PUBLISH_SITE_BRANCH:-main}"
 web_container="$(publish_setting NODECODE_PUBLISH_WEB_CONTAINER)" || exit 1
 [ -f "$authority_installer" ] || { echo "publish: missing authority installer $authority_installer" >&2; exit 1; }
@@ -144,11 +149,13 @@ if has_platform x86_64-windows && [ ! -s "$tar_zst" ] && [ -s "$OUT/nodecode-$la
   }
 fi
 
+# The restart's log is this run's own: a fixed /tmp name is a file another
+# account's publish may own, and the release runner's could not write it.
 restart_web() {
   ssh -o BatchMode=yes "$host" \
     "cd '$app_dir' && docker compose -f '$compose_file' --env-file '$env_file' restart web" \
-    >/tmp/nodecode-publish-restart.log 2>&1 || {
-      cat /tmp/nodecode-publish-restart.log
+    >"$work/restart.log" 2>&1 || {
+      cat "$work/restart.log"
       return 1
     }
 }
