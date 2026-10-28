@@ -4058,11 +4058,17 @@ the longest directory's (a path ending in /) that URI lies under."
     (let* ((uri (let ((raw (or (getf env :request-uri) ""))) (subseq raw 0 (position #\? raw))))
            ;; The non-empty segments after the session prefix: an id or an op
            ;; that would contain a slash simply lands in the next segment.
+           ;; The segments arrive percent-encoded: the page writes a session
+           ;; id the way encodeURIComponent does, and a channel session's id
+           ;; carries the ':' and '$' of the room and message ids it is named
+           ;; for. Split first and decode each segment after -- decoding
+           ;; before the split would let a %2F invent one.
            (segments (let ((prefix "/api/gateway/sessions/"))
                        (when (uiop:string-prefix-p prefix uri)
-                         (remove "" (uiop:split-string (subseq uri (length prefix))
-                                                       :separator "/")
-                                 :test #'string=))))
+                         (mapcar (lambda (segment) (quri:url-decode segment))
+                                 (remove "" (uiop:split-string (subseq uri (length prefix))
+                                                               :separator "/")
+                                         :test #'string=)))))
            (session-id (first segments))
            ;; OP names the subroute: the segments after the session id, the
            ;; third read as `*' -- a checkpoint id, an image key -- and handed

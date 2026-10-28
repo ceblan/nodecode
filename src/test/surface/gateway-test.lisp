@@ -5445,3 +5445,28 @@ default target is PROVIDER/MODEL-ID, restored after."
       (is frame)
       (is-shape frame ((:string "payload" "comment") "Fold finished work")
         ((:string "payload" "session_id") "mutate-peer") ("sequence" eql 0)))))
+
+(deftest a-percent-encoded-session-id-reaches-its-session ()
+  ;; The page writes the id the way encodeURIComponent does (SESSIONPATH in
+  ;; app.js), and a channel session is named for a room and a message, so its
+  ;; id carries ':' and '$'. Taking the path segment verbatim answered
+  ;; unknown_session for every such session -- the Run view of a Matrix
+  ;; session said 'session does not exist' while s-<base36> sessions, whose
+  ;; ids encode to themselves, read fine.
+  (with-gateway-scratch (dir "gw-encoded" :store t)
+    (let* ((id "matrix-sidecar-!room:server-m$abc")
+           (encoded "matrix-sidecar-!room%3Aserver-m%24abc")
+           (nle::*gateway-operator-token* "test-token")
+           (app (nle::make-sync-app))
+           (headers (make-hash-table :test #'equal)))
+      (setf (gethash "host" headers) "127.0.0.1:8780"
+            (gethash "authorization" headers) "Bearer test-token")
+      (ensure-durable-session id)
+      (flet ((ask (path)
+               (funcall app (list :request-method :get :request-uri path :headers headers))))
+        (let ((answer (ask (format nil "/api/gateway/sessions/~a/timeline" encoded))))
+          (is (eql 200 (first answer)) "the encoded path names the session"))
+        (let ((answer (ask (format nil "/api/gateway/sessions/~a/timeline" id))))
+          (is (eql 200 (first answer)) "an id that needs no encoding still reads"))
+        (let ((answer (ask "/api/gateway/sessions/no-such-session/timeline")))
+          (is (eql 404 (first answer)) "a session that does not exist is still a 404"))))))
