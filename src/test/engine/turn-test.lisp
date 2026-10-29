@@ -1578,7 +1578,13 @@ SESSION-ID, in log order."
         (equal "{\"id\":\"x\"}" value) "payload is the string after 'data: '")
   (done "data: [DONE]" :done "[DONE] yields :done" (null value) "value is NIL for :done")
   (empty "" :empty "blank line yields :empty" (null value) "value is NIL for :empty")
-  (comment ": keep-alive" :comment ": prefix yields :comment" (stringp value) "comment carries its text"))
+  (comment ": keep-alive" :comment ": prefix yields :comment" (stringp value) "comment carries its text")
+  (spaceless "data:{\"id\":\"x\"}" :data "Kimi's spaceless data: prefix yields :data"
+            (equal "{\"id\":\"x\"}" value) "payload keeps the JSON and drops the colon")
+  (spaceless-done "data:[DONE]" :done "the spaceless sentinel yields :done"
+                  (null value) "value is NIL for :done")
+  (event "event:message_start" :comment "an event: line stays a comment"
+         (equal "event:message_start" value) "its text is carried whole"))
 
 ;;; --- B1: SSE stream helpers ---------------------------------------------
 

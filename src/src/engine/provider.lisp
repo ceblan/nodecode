@@ -3798,9 +3798,10 @@ plists (:id :display :context-window :owned-by :kind), or NIL and why."
              for raw = (json-first entry :text '("id") '("name"))
              for id = (and raw (nlk:trimmed (ppcre:regex-replace "(?s)^models/(?=.)" raw "")))
              ;; a window the listing happens to carry: vLLM's max_model_len,
-             ;; OpenRouter's context_length, google's, llama.cpp's n_ctx_train
+             ;; OpenRouter's context_length, google's, llama.cpp's n_ctx_train, the pi catalog's contextWindow
              for window = (json-first entry :integer '("max_model_len") '("context_length")
-                                      '("inputTokenLimit") '("meta" "n_ctx_train"))
+                                      '("inputTokenLimit") '("meta" "n_ctx_train")
+                                      '("contextWindow"))
              when (and id (plusp (length id))
                        (not (find id rows :key (lambda (row) (getf row :id))
                                            :test #'string=)))
@@ -3820,15 +3821,20 @@ plists (:id :display :context-window :owned-by :kind), or NIL and why."
                nil)))))
 
 (defun listing-urls (base)
-  "The URLs a listing GET tries, in order: <BASE>/models, and — when BASE
-names no API version segment of its own — <BASE>/v1/models after it."
+  "The URLs a listing GET tries, in order: <BASE>/models, <BASE>/v1/models
+when BASE names no API version segment of its own, and <BASE>/model-catalog
+last."
   ;; An operator's anthropic base is often the bare host (the lane path
   ;; supplies /messages), and a bare host answers /models with its web app,
-  ;; not a listing.
+  ;; not a listing. The catalog last is the pi-protocol gateway's own
+  ;; listing (Radius answers /v1/model-catalog with models[] and 404s on
+  ;; /models), so asking every other provider for it costs one 404.
   (let* ((base (string-right-trim "/" base))
          ;; its last path segment a v and a digit, then anything: v1, v1beta
          (versioned (ppcre:scan "(?i)(?:^|/)v\\d[^/]*$" base)))
-    (cons (uiop:strcat base "/models") (unless versioned (list (uiop:strcat base "/v1/models"))))))
+    (append (cons (uiop:strcat base "/models")
+                  (unless versioned (list (uiop:strcat base "/v1/models"))))
+            (list (uiop:strcat base "/model-catalog")))))
 
 (defun list-provider-models (provider &key key (base (provider-base-url provider)))
   "(values ROWS ERROR): GET the configured PROVIDER's model listing from
@@ -4055,8 +4061,18 @@ KEEP-ALIVE-STREAM against its character DECODING-STREAM."
   ;;   :empty   — a blank line (SSE field separator); value is NIL
   (cond
     ((string= line "") (values :empty nil))
-    ((string= line "data: [DONE]") (values :done nil))
-    ((uiop:string-prefix-p "data: " line) (values :data (subseq line 6)))
+    ;; The field is split at its first colon and one optional leading space
+    ;; is dropped: the SSE rule, which the anthropic-shaped providers state
+    ;; exactly and others only loosely. Kimi's coding endpoint writes
+    ;; "data:{...}" with no space, and a prefix test for "data: " dropped
+    ;; every frame of its stream -- a clean 200 whose walk saw nothing.
+    ((uiop:string-prefix-p "data:" line)
+     (let ((value (subseq line 5)))
+       (when (and (plusp (length value)) (char= (char value 0) #\Space))
+         (setf value (subseq value 1)))
+       (if (string= value "[DONE]")
+           (values :done nil)
+           (values :data value))))
     ((uiop:string-prefix-p ":" line) (values :comment (subseq line 1)))
     (t (values :comment line))))
 
